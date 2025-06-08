@@ -21,7 +21,7 @@ logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
-BudgetType = Literal["token", "computational_load"]
+BudgetType = Literal["token", "computational_load", "time"]
 
 
 @config

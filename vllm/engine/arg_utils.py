@@ -587,7 +587,7 @@ class EngineArgs:
     dcpp_min_chunk: int | None = SchedulerConfig.dcpp_min_chunk
     dcpp_length_threshold: int = SchedulerConfig.dcpp_length_threshold
 
-    budget_type: BudgetType = "computational_load"
+    budget_type: BudgetType = "time"
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`

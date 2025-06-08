@@ -1,6 +1,9 @@
 """
 Model Configuration P-Value Estimator
 Estimate non-attention and attention calculation ratio for different model architectures
+
+Supports dynamic calibration using Extended Kalman Filter (EKF) to update
+FLOPs estimation parameters based on actual execution time.
 """
 
 import json
@@ -8,6 +11,8 @@ import argparse
 from abc import ABC, abstractmethod
 from typing import Dict, Tuple, List, Optional
 import logging
+import numpy as np
+
 
 # Global logger: prefer vllm logger if available, else fallback to std logging
 try:
@@ -44,8 +49,25 @@ class BaseModelEstimator(ABC):
         # Baseline and attention-equivalent tokens configured from scheduler
         self.attn_equiv_baseline_c: int = 0
         self.attn_equiv_tokens: int = 0
-        self.a = 0
-        self.b = 0
+        
+        # FLOPs estimation parameters: FLOPs = a·(C+H) + b·C·(C+H) + d
+        self.a = 0.0
+        self.b = 0.0
+        self.d = 0.0
+        
+        # Time calibration: cost_time = k * (a·(C+H) + b·C·(C+H) + d)
+        self.k = 1e-12  # Initial scale factor (FLOPs to seconds)
+        
+        # Extended Kalman Filter state
+        self._ekf_initialized = False
+        self._ekf_state = None  # [a, b, d, k]
+        self._ekf_covariance = None  # 4x4 covariance matrix
+        
+        # EKF tuning parameters
+        self._ekf_process_noise_q = 1e-6  # Process noise variance
+        self._ekf_measurement_noise_r = 1e-4  # Measurement noise variance
+        self._ekf_min_samples_for_init = 1  # Min samples for k initialization
+        self._ekf_sample_buffer: List[Tuple[int, int, float]] = []  # (C, H, time)
     
     def _parse_common_config(self):
         """Parse common configuration parameters"""
@@ -216,12 +238,14 @@ class BaseModelEstimator(ABC):
                                       block_size: int,
                                       layer_idx: Optional[int] = None) -> int:
         """                            
-        FLOPs ≈ a·C + b·C·(C+H)
+        FLOPs = a·(C+H) + b·C·(C+H) + d
         C = chunk_size
         H = hist_seq_len
-        a = 线性项系数(FFN+投影+残差)
+        a = 线性项系数(与序列长度相关)
         b = 注意力二次项系数
-        后续 a和b的计算可以提出来 作为init
+        d = 常数项(固定开销)
+        
+        通过联立三元一次方程求解a, b, d参数
         
         Args:
             hist_seq_len: KV缓存长度
@@ -233,38 +257,16 @@ class BaseModelEstimator(ABC):
             chunk_size: 估算的chunk大小
             scheduled_flops: 实际消耗的flops
         """
-        if self.a == 0 or self.b == 0:
-            test_c1 = block_size * 10
-            test_c2 = block_size * 20
-            
-            f1 = self.calculate_current_flops(test_c1, hist_seq_len, layer_idx)
-            f2 = self.calculate_current_flops(test_c2, hist_seq_len, layer_idx)
-            
-            H = hist_seq_len
-            # FLOPs ≈ a·C + b·C·(C+H)
-            # 求a和b
-            det = test_c1 * test_c2 * (test_c2 - test_c1)
-            b = (test_c1 * f2 - test_c2 * f1) / det
-            a = (f1 - b * test_c1 * (test_c1 + H)) / test_c1
-            self.a = a
-            self.b = b
-            self.test_c1 = test_c1
-            self.test_c2 = test_c2
-            self.f1 = f1
-            self.f2 = f2
+        if self.a == 0 and self.b == 0 and self.d == 0:
+            self._init_abd_params(hist_seq_len, block_size, layer_idx)
     
         a = self.a
         b = self.b
-
-        # print(f"=======================================================================")
-        # print(f"============hist_seq_len:{hist_seq_len}|target_flops:{target_flops}|")
-        # print(f"============a:{a}|b:{b}")
-        # print(f"============f1:{f1}|f2:{f2}|det:{det}")
-        # print(f"================chunk_size:{chunk_size}|block_size:{block_size}")
+        d = self.d
+        H = hist_seq_len
 
         if b <= 0 or a <= 0:
-            # a和b应该为正，如果为负说明二次模型不合适
-            # 使用线性模型：FLOPs ≈ (a + b*H) * C
+            # a和b应该为正，如果为负说明模型不合适，使用线性近似
             test_c1 = block_size * 10
             test_c2 = block_size * 20
             
@@ -272,33 +274,425 @@ class BaseModelEstimator(ABC):
             f2 = self.calculate_current_flops(test_c2, hist_seq_len, layer_idx)
             
             linear_coeff = (f2 - f1) / (test_c2 - test_c1)
-            chunk_size = target_flops / linear_coeff
+            chunk_size = target_flops / linear_coeff if linear_coeff > 0 else block_size
         else:
-            # b为正，使用二次模型
-            # b*C² + (a + b*H)*C - target_flops = 0
+            # 求解: a·(C+H) + b·C·(C+H) + d = target_flops
+            # 展开: a·C + a·H + b·C² + b·C·H + d = target_flops
+            # 整理: b·C² + (a + b·H)·C + (a·H + d - target_flops) = 0
             A = b
-            B = a + b * hist_seq_len
-            C_coeff = -target_flops
+            B = a + b * H
+            C_coeff = d - target_flops
             
             discriminant = B**2 - 4 * A * C_coeff
-            chunk_size = (-B + discriminant**0.5) / (2 * A)
-        
-        
-        # # b*C² + (a + b*H)*C - target_flops = 0
-        # A = b
-        # B = a + b * H
-        # C_coeff = -target_flops
-        # discriminant = B**2 - 4*A*C_coeff
-        # chunk_size = (-B + discriminant**0.5) / (2 * A)
-        # print(f"=======================================================================")
-        # print(f"============hist_seq_len:{hist_seq_len}|target_flops:{target_flops}|")
-        # print(f"============a:{a}|b:{b}")
-        # print(f"================chunk_size:{chunk_size}|block_size:{block_size}")
-        
+            if discriminant < 0:
+                # 无解，使用线性近似
+                chunk_size = (target_flops - d) / (a + b * H) if (a + b * H) > 0 else block_size
+            else:
+                chunk_size = (-B + discriminant**0.5) / (2 * A)
+        print(f">>>>>>>>>>>> flop schedule chunk_size {chunk_size} H {H}, a {a} b {b} d {d}, target_flops {target_flops}")
         chunk_size = max(block_size, int(chunk_size))
         chunk_size = (chunk_size + block_size - 1) // block_size * block_size
         
         return chunk_size, None
+    
+    def _init_abd_params(self, hist_seq_len: int, block_size: int, 
+                         layer_idx: Optional[int] = None) -> None:
+        """
+        通过联立三元一次方程求解 a, b, d 参数
+        
+        FLOPs = a·(C+H) + b·C·(C+H) + d
+        
+        使用三个测试点 (C1, C2, C3) 建立方程组：
+        F1 = a·(C1+H) + b·C1·(C1+H) + d
+        F2 = a·(C2+H) + b·C2·(C2+H) + d
+        F3 = a·(C3+H) + b·C3·(C3+H) + d
+        """
+        # 选择三个不同的chunk大小作为测试点
+        test_c1 = block_size * 8
+        test_c2 = block_size * 16
+        test_c3 = block_size * 32
+        
+        H = hist_seq_len
+        
+        # 计算三个测试点的FLOPs
+        f1 = self.calculate_current_flops(test_c1, H, layer_idx)
+        f2 = self.calculate_current_flops(test_c2, H, layer_idx)
+        f3 = self.calculate_current_flops(test_c3, H, layer_idx)
+        
+        # 构建方程组系数矩阵
+        # | S1  P1  1 |   | a |   | F1 |
+        # | S2  P2  1 | × | b | = | F2 |
+        # | S3  P3  1 |   | d |   | F3 |
+        # 其中 Si = Ci + H, Pi = Ci * Si
+        
+        L1, L2, L3 = test_c1, test_c2, test_c3
+        P1, P2, P3 = test_c1 * (test_c1 + H), test_c2 * (test_c2 + H), test_c3 * (test_c3 + H)
+        
+        # 使用克莱默法则求解
+        # 计算主行列式 det(M)
+        det_M = (L1 * (P2 - P3) - P1 * (L2 - L3) + (L2 * P3 - L3 * P2))
+        
+        if abs(det_M) < 1e-10:
+            # 行列式接近0，方程组可能无解或有无穷解，使用简化的二元方程求解
+            logger.warning("三元方程组行列式接近0，使用简化的二元求解")
+            self._init_ab_params_fallback(hist_seq_len, block_size, layer_idx)
+            return
+        
+        # det_a: 将第一列替换为 [F1, F2, F3]
+        det_a = (f1 * (P2 - P3) - P1 * (f2 - f3) + (f2 * P3 - f3 * P2))
+        
+        # det_b: 将第二列替换为 [F1, F2, F3]  
+        det_b = (L1 * (f2 - f3) - f1 * (L2 - L3) + (L2 * f3 - L3 * f2))
+        
+        # det_d: 将第三列替换为 [F1, F2, F3]
+        det_d = (L1 * (P2 * f3 - P3 * f2) - P1 * (L2 * f3 - L3 * f2) + 
+                 f1 * (L2 * P3 - L3 * P2))
+        
+        self.a = det_a / det_M
+        self.b = det_b / det_M
+        self.d = det_d / det_M
+        
+        # 存储测试数据用于调试
+        self._init_test_data = {
+            'test_c': (test_c1, test_c2, test_c3),
+            'flops': (f1, f2, f3),
+            'hist_seq_len': H
+        }
+        
+        logger.debug(f"初始化FLOPs参数: a={self.a:.2e}, b={self.b:.2e}, d={self.d:.2e}")
+    
+    def _init_ab_params_fallback(self, hist_seq_len: int, block_size: int,
+                                  layer_idx: Optional[int] = None) -> None:
+        """二元方程组求解的fallback方案（忽略常数项d）"""
+        test_c1 = block_size * 10
+        test_c2 = block_size * 20
+        
+        f1 = self.calculate_current_flops(test_c1, hist_seq_len, layer_idx)
+        f2 = self.calculate_current_flops(test_c2, hist_seq_len, layer_idx)
+        
+        H = hist_seq_len
+        S1, S2 = test_c1 + H, test_c2 + H
+        P1, P2 = test_c1 * S1, test_c2 * S2
+        
+        # 简化方程: a·S + b·P ≈ F (忽略d)
+        det = S1 * P2 - S2 * P1
+        if abs(det) < 1e-10:
+            # 仍然无法求解，使用默认值
+            self.a = f1 / S1 if S1 > 0 else 1.0
+            self.b = 1e-6
+            self.d = 0.0
+        else:
+            self.a = (f1 * P2 - f2 * P1) / det
+            self.b = (S1 * f2 - S2 * f1) / det
+            self.d = 0.0
+    
+    # -------------------------
+    # 时间校准和EKF动态更新
+    # -------------------------
+    
+    def compute_flops_from_params(self, chunk_size: int, hist_seq_len: int) -> float:
+        """
+        根据当前参数计算FLOPs
+        FLOPs = a·(C+H) + b·C·(C+H) + d
+        """
+        C, H = chunk_size, hist_seq_len
+        return self.a * C + self.b * C * (C + H) + self.d
+    
+    def compute_time_from_params(self, chunk_size: int, hist_seq_len: int) -> float:
+        """
+        根据当前参数计算预估执行时间
+        cost_time = k * (a·(C+H) + b·C·(C+H) + d)
+        """
+        flops = self.compute_flops_from_params(chunk_size, hist_seq_len)
+        return self.k * flops
+    
+    def compute_chunk_size_from_target_time(self, 
+                                            hist_seq_len: int,
+                                            target_time: float,
+                                            base_chunk_size: int,
+                                            block_size: int) -> int:
+        """
+        根据目标执行时间反解chunk_size
+        cost_time = k * (a·(C+H) + b·C·(C+H) + d)
+        
+        target_time / k = a·(C+H) + b·C·(C+H) + d
+        展开: b·C² + (a + b·H)·C + (a·H + d - target_time/k) = 0
+        """
+        if self.k <= 0:
+            return block_size
+            
+        target_flops = target_time / self.k
+        H = hist_seq_len
+        a, b, d = self.a, self.b, self.d
+        
+        if b <= 0:
+            # 线性近似
+            chunk_size = (target_flops - d) / (a + b * H) if (a + b * H) > 0 else block_size
+        else:
+            # 二次方程求解
+            A = b
+            B = a + b * H
+            C_coeff = d - target_flops
+            
+            discriminant = B**2 - 4 * A * C_coeff
+            if discriminant < 0:
+                chunk_size = (target_flops - d) / (a + b * H) if (a + b * H) > 0 else block_size
+            else:
+                chunk_size = (-B + discriminant**0.5) / (2 * A)
+
+        chunk_size = base_chunk_size + 1.0 * (chunk_size - base_chunk_size)
+        chunk_size = max(block_size, int(chunk_size))
+        chunk_size = (chunk_size + block_size - 1) // block_size * block_size
+        print(f">>>>>>>>>>>>>>>> time scheduler chunk_size {chunk_size}, a {self.a}, b {self.b} d {self.d} k {self.k}, target_flops {target_flops}")
+        
+        return chunk_size
+    
+    def record_execution_time(self, chunk_size: int, hist_seq_len: int, 
+                               elapsed_time: float) -> None:
+        """
+        记录一次执行时间（单请求模式），并使用EKF更新参数
+        
+        注意：当一次调度多条请求时，应使用 record_batch_execution_time() 方法
+        
+        Args:
+            chunk_size: 本次执行的chunk大小
+            hist_seq_len: KV缓存长度
+            elapsed_time: 实际执行时间(秒)
+        """
+        # 转换为batch格式，单请求作为一个元素的batch
+        self.record_batch_execution_time(
+            request_chunks=[(chunk_size, hist_seq_len)],
+            elapsed_time=elapsed_time
+        )
+    
+    def record_batch_execution_time(self, 
+                                     request_chunks: List[Tuple[int, int]], 
+                                     elapsed_time: float) -> None:
+        """
+        记录一次batch执行时间，并使用EKF更新参数
+        
+        当一次调度多条请求时，使用此方法记录总耗时。
+        EKF观测方程变为batch级别：
+        z_batch = Σ [ k * (a*(C_i+H_i) + b*C_i*(C_i+H_i) + d) ]
+        
+        Args:
+            request_chunks: 请求列表，每个元素为 (chunk_size, hist_seq_len)
+            elapsed_time: batch的实际总执行时间(秒)
+        """
+        if not request_chunks or elapsed_time <= 0:
+            return
+        
+        # 计算总chunk_size用于样本收集
+        total_chunk_size = sum(c for c, h in request_chunks)
+        if total_chunk_size <= 0:
+            return
+        
+        # 如果a,b,d还未初始化，先收集样本
+        # 使用加权平均作为近似（仅用于初始化阶段）
+        if self.a == 0 and self.b == 0 and self.d == 0:
+            avg_hist = sum(h for c, h in request_chunks) // len(request_chunks) if request_chunks else 0
+            self._ekf_sample_buffer.append((total_chunk_size, avg_hist, elapsed_time))
+            if len(self._ekf_sample_buffer) >= self._ekf_min_samples_for_init:
+                self._init_params_from_samples()
+            return
+        
+        # 如果k还未初始化，根据预估FLOPs和实际时间估算k
+        if not self._ekf_initialized:
+            # 计算batch总预估FLOPs
+            total_flops = sum(
+                self.compute_flops_from_params(c, h) 
+                for c, h in request_chunks
+            )
+            if total_flops > 0:
+                self._ekf_sample_buffer.append((total_chunk_size, 0, elapsed_time))
+                # 直接用总flops和总时间估算k
+                k_estimate = elapsed_time / total_flops
+                self._ekf_sample_buffer_k = getattr(self, '_ekf_sample_buffer_k', [])
+                self._ekf_sample_buffer_k.append(k_estimate)
+                
+                if len(self._ekf_sample_buffer_k) >= self._ekf_min_samples_for_init:
+                    # 使用中位数作为k的初始估计
+                    self._ekf_sample_buffer_k.sort()
+                    mid = len(self._ekf_sample_buffer_k) // 2
+                    self.k = self._ekf_sample_buffer_k[mid]
+                    logger.debug(f"初始化时间校准系数: k={self.k:.2e}")
+                    self._ekf_sample_buffer.clear()
+                    self._ekf_sample_buffer_k.clear()
+                    self._init_ekf_state()
+            return
+        
+        # EKF batch更新
+        self._ekf_batch_update(request_chunks, elapsed_time)
+    
+    def _init_params_from_samples(self) -> None:
+        """从收集的样本初始化a, b, d参数"""
+        if len(self._ekf_sample_buffer) < 3:
+            return
+        
+        # 使用前三个样本建立方程组
+        samples = self._ekf_sample_buffer[:3]
+        
+        C1, H1, t1 = samples[0]
+        C2, H2, t2 = samples[1]
+        C3, H3, t3 = samples[2]
+        
+        # 暂时假设 k*FLOPs = time，使用相对值来估算a, b, d
+        # 先用默认block_size进行初始化
+        block_size = 16  # 默认值
+        self._init_abd_params(H1, block_size)
+    
+    def _init_k_from_samples(self) -> None:
+        """从收集的样本初始化k参数"""
+        if len(self._ekf_sample_buffer) < self._ekf_min_samples_for_init:
+            return
+        
+        k_estimates = []
+        for chunk_size, hist_seq_len, elapsed_time in self._ekf_sample_buffer:
+            flops = self.compute_flops_from_params(chunk_size, hist_seq_len)
+            if flops > 0:
+                k_estimates.append(elapsed_time / flops)
+        
+        if k_estimates:
+            # 使用中位数作为k的初始估计（更鲁棒）
+            k_estimates.sort()
+            mid = len(k_estimates) // 2
+            self.k = k_estimates[mid]
+            logger.debug(f"初始化时间校准系数: k={self.k:.2e}")
+        
+        # 清空样本缓冲区
+        self._ekf_sample_buffer.clear()
+    
+    def _init_ekf_state(self) -> None:
+        """初始化EKF状态"""
+        
+        # 状态向量: [a, b, d, k]
+        self._ekf_state = np.array([self.a, self.b, self.d, self.k], dtype=np.float64)
+        
+        # 初始协方差矩阵 (对角矩阵，较大的初始不确定性)
+        self._ekf_covariance = np.diag([
+            (self.a * 0.1)**2 if self.a > 0 else 1e10,  # a的方差
+            (self.b * 0.1)**2 if self.b > 0 else 1e-12,  # b的方差
+            (abs(self.d) * 0.1)**2 if self.d != 0 else 1e10,  # d的方差
+            (self.k * 0.1)**2 if self.k > 0 else 1e-24,  # k的方差
+        ])
+        
+        self._ekf_initialized = True
+        logger.debug("EKF已初始化")
+    
+    def _ekf_update(self, chunk_size: int, hist_seq_len: int, 
+                    elapsed_time: float) -> None:
+        """
+        扩展卡尔曼滤波更新步骤（单请求）
+        
+        观测方程: z = k * (a*(C+H) + b*C*(C+H) + d) + v
+        其中 v ~ N(0, R) 是测量噪声
+        
+        状态向量: x = [a, b, d, k]^T
+        """
+        # 转换为batch格式
+        self._ekf_batch_update([(chunk_size, hist_seq_len)], elapsed_time)
+    
+    def _ekf_batch_update(self, request_chunks: List[Tuple[int, int]], 
+                          elapsed_time: float) -> None:
+        """
+        扩展卡尔曼滤波batch更新步骤
+        
+        观测方程 (batch级别): 
+        z_batch = Σ_i [ k * (a*(C_i+H_i) + b*C_i*(C_i+H_i) + d) ] + v
+        
+        雅可比矩阵:
+        dz/da = k * Σ_i (C_i + H_i)
+        dz/db = k * Σ_i C_i*(C_i + H_i)
+        dz/dd = k * N  (N是请求数量)
+        dz/dk = Σ_i (a*(C_i+H_i) + b*C_i*(C_i+H_i) + d) = total_flops
+        
+        状态向量: x = [a, b, d, k]^T
+        """
+        if self._ekf_state is None or self._ekf_covariance is None:
+            return
+        
+        if not request_chunks:
+            return
+        
+        a, b, d, k = self._ekf_state
+        N = len(request_chunks)
+        
+        # 1. 预测步骤 (假设参数缓慢变化，状态转移矩阵为单位矩阵)
+        Q = np.eye(4) * self._ekf_process_noise_q
+        P_pred = self._ekf_covariance + Q
+        
+        # 2. 计算batch级别的预测值和雅可比矩阵
+        sum_C = 0.0    # Σ (C_i + H_i)
+        sum_P = 0.0    # Σ C_i*(C_i + H_i)
+        total_flops = 0.0
+        
+        for C, H in request_chunks:
+            P_i = C * (C + H)
+            flops_i = a * C + b * P_i + d
+            
+            sum_C += C
+            sum_P += P_i
+            total_flops += flops_i
+        
+        # 预测的batch总耗时
+        z_pred = k * total_flops
+        
+        # 计算观测雅可比矩阵 H_jac = dz/dx
+        H_jac = np.array([
+            k * sum_C,       # dz/da
+            k * sum_P,       # dz/db
+            k * N,           # dz/dd
+            total_flops      # dz/dk
+        ]).reshape(1, 4)
+        
+        # 计算卡尔曼增益
+        R = self._ekf_measurement_noise_r * elapsed_time**2
+        S_innov = H_jac @ P_pred @ H_jac.T + R
+        K = P_pred @ H_jac.T / S_innov[0, 0]
+        
+        # 更新状态
+        innovation = elapsed_time - z_pred
+        self._ekf_state = self._ekf_state + K.flatten() * innovation
+        
+        # 更新协方差
+        I = np.eye(4)
+        self._ekf_covariance = (I - K @ H_jac) @ P_pred
+        
+        # 参数约束：确保物理意义的合理性
+        self._ekf_state[0] = max(1e-10, self._ekf_state[0])  # a > 0
+        self._ekf_state[1] = max(1e-20, self._ekf_state[1])  # b > 0
+        self._ekf_state[3] = max(1e-20, self._ekf_state[3])  # k > 0
+        
+        # 更新实例变量
+        self.a, self.b, self.d, self.k = self._ekf_state
+        
+        # 调试日志
+        # if logger.isEnabledFor(logging.DEBUG):
+        total_chunk = sum(c for c, h in request_chunks)
+        logger.info(
+            f"EKF batch更新: N={N}, total_chunk={total_chunk}, "
+            f"预测时间={z_pred:.6f}s, 实际时间={elapsed_time:.6f}s, "
+            f"残差={innovation:.6f}s ({abs(innovation/elapsed_time*100):.1f}%)"
+        )
+        logger.info(
+            f"EKF参数: a={self.a:.2e}, b={self.b:.2e}, "
+            f"d={self.d:.2e}, k={self.k:.2e}"
+        )
+    
+    def get_ekf_state_info(self) -> Dict:
+        """获取EKF状态信息用于调试"""
+        info = {
+            'initialized': self._ekf_initialized,
+            'params': {'a': self.a, 'b': self.b, 'd': self.d, 'k': self.k},
+            'sample_buffer_size': len(self._ekf_sample_buffer),
+        }
+        
+        if self._ekf_covariance is not None:
+            # 提取标准差
+            std = np.sqrt(np.diag(self._ekf_covariance))
+            info['std'] = {'a': std[0], 'b': std[1], 'd': std[2], 'k': std[3]}
+        
+        return info
     
     def estimate_flops_ratio(self, chunk_size: int, kv_cache_len: int, layer_idx: Optional[int] = None) -> float:
         """

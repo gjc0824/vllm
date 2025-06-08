@@ -238,13 +238,51 @@ class Scheduler(SchedulerInterface):
         self.dcpp_min_chunk = self.scheduler_config.dcpp_min_chunk or 0
         self._maybe_init_dcpp(vllm_config)
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        
+        # 目标执行耗时配置 (秒)，用于EKF动态调整chunk大小
+        # 初始值设为0表示EKF尚未校准，fallback到FLOPs模式
+        self.dcpp_target_execution_time: float = getattr(
+            self.scheduler_config, 'dcpp_target_execution_time', 0.0
+        )
+        # 用于追踪hist_seq_len的状态 (供core.py的timing记录使用)
+        self._timing_hist_seq_len: int = 0
 
-        self.budget_type = self.scheduler_config.budget_type
-        # print(f"=======================self.budget_type:{self.budget_type}") 
+        # DCPP开关自动控制budget_type:
+        # - enable_dcpp=True  -> 使用计算量调度 (computational_load)
+        # - enable_dcpp=False -> 使用token数目调度 (token)
+        # 用户也可以通过显式设置budget_type来覆盖此行为
+        if self.enable_dcpp:
+            # DCPP启用时，如果用户未显式设置budget_type，则使用计算量调度
+            self.budget_type = self.scheduler_config.budget_type
+            if self.budget_type == "token":
+                logger.warning(
+                    "enable_dcpp=True but budget_type='token'. "
+                    "For optimal DCPP performance, consider using "
+                    "'computational_load' or 'time' budget_type."
+                )
+        else:
+            # DCPP未启用时，使用token数目调度（除非用户显式设置了其他类型）
+            # 默认回退到token调度
+            self.budget_type = "token"
+            if self.scheduler_config.budget_type != "token":
+                logger.info(
+                    "enable_dcpp=False, automatically using 'token' budget_type. "
+                    "Set enable_dcpp=True to use '%s' budget_type.",
+                    self.scheduler_config.budget_type
+                )
+        
+        logger.debug(f"Scheduler budget_type: {self.budget_type} (enable_dcpp={self.enable_dcpp})")
 
         self.token_budget = TokenBudget(self)
         self.max_num_scheduled_flops = self.token_budget.get_max_flops()
-        # print(f"=======================self.max_num_scheduled_flops:{self.max_num_scheduled_flops}")
+        
+        # 记录上一次调度的预估总耗时 (供EKF更新使用)
+        self._last_scheduled_estimated_time: float = 0.0
+        
+        # 记录上一次的实际执行耗时，作为下次调度的目标耗时
+        # 这是最直接的自适应方案：用实际耗时指导下次调度
+        self._last_actual_execution_time: float = 0.0
+        self._target_time_list = []
 
         def has_mamba_layers(kv_cache_config: KVCacheConfig) -> bool:
             return any(
@@ -338,7 +376,6 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
-
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -427,19 +464,48 @@ class Scheduler(SchedulerInterface):
             if self.enable_dcpp and request.is_dcpp and self.attn_estimator is not None:
                 # 后续可以做到budget里面
                 dcpp_equitable_tokens = num_new_tokens
-                # total_tokens = self.scheduler_config.long_prefill_token_threshold \
-                #     if self.scheduler_config.long_prefill_token_threshold > 0 else token_budget
-                target_tokens = min(token_budget.get_flops(), self.max_num_scheduled_flops)
-
-                num_new_tokens, dcpp_scheduled_chunk = \
-                        self.attn_estimator.compute_chunk_size_with_flops(
-                            request.num_computed_tokens,
-                            target_tokens,
-                            self.cache_config.block_size)
+                
+                # 优先使用上次实际耗时作为目标 (最直接的自适应方案)
+                logger.info(f"======= time or flops ======= , {self.attn_estimator._ekf_initialized}, target_execution_time: {self._last_actual_execution_time}")
+                # self.attn_estimator._ekf_initialized = False
+                if (self.attn_estimator._ekf_initialized and 
+                    self._last_actual_execution_time > 0):
+                    # 使用上次实际执行耗时作为本次的目标耗时
+                    # 如果有time_budget，取剩余时间和目标时间的较小值
+                    target_time = self._last_actual_execution_time
+                    if token_budget.is_time_budget_mode():
+                        remaining_time = token_budget.get_time()
+                        target_time = min(remaining_time, target_time) if remaining_time > 0 else target_time
+                    
+                    num_new_tokens = self.attn_estimator.compute_chunk_size_from_target_time(
+                        request.num_computed_tokens,
+                        target_time,
+                        self.scheduler_config.max_num_batched_tokens,
+                        self.cache_config.block_size
+                    )
+                    dcpp_scheduled_chunk = num_new_tokens
+                elif self.dcpp_target_execution_time > 0:
+                    # 有用户设置的固定目标耗时
+                    num_new_tokens = self.attn_estimator.compute_chunk_size_from_target_time(
+                        request.num_computed_tokens,
+                        self.dcpp_target_execution_time,
+                        self.scheduler_config.max_num_batched_tokens,
+                        self.cache_config.block_size
+                    )
+                    dcpp_scheduled_chunk = num_new_tokens
+                else:
+                    # Fallback: 使用FLOPs目标值
+                    target_tokens = min(token_budget.get_flops(), self.max_num_scheduled_flops)
+                    num_new_tokens, dcpp_scheduled_chunk = \
+                            self.attn_estimator.compute_chunk_size_with_flops(
+                                request.num_computed_tokens,
+                                target_tokens,
+                                self.cache_config.block_size)
 
                 # 1.dcpp 2.chunk_size 3.request需要计算的 4.floor
                 # NOTE: Prevent short tail effect
                 floor = self.dcpp_min_chunk if self.dcpp_min_chunk and self.dcpp_min_chunk > 0 else 0
+                print(">>>>>>>>>>>dcpp_equitable_tokens", dcpp_equitable_tokens)
                 num_new_tokens = min(num_new_tokens, dcpp_equitable_tokens)
                 num_new_tokens = min(request.num_tokens - request.num_computed_tokens,
                                      max(floor, num_new_tokens))
@@ -535,7 +601,7 @@ class Scheduler(SchedulerInterface):
                num_computed_tokens = request.num_computed_tokens,
                computed_prompt = request.computed_prompt
             )
-            # logger.info(f"==========================num_new_tokens:{num_new_tokens}|request.num_computed_tokens:{request.num_computed_tokens}|request.num_tokens:{request.num_tokens}|token_budget:{token_budget.get_flops()}")
+            logger.info(f"==========================num_new_tokens:{num_new_tokens}|request.num_computed_tokens:{request.num_computed_tokens}|request.num_tokens:{request.num_tokens}|token_budget:{token_budget.get_flops()}")
             req_index += 1
 
             # Speculative decode related.
@@ -720,8 +786,33 @@ class Scheduler(SchedulerInterface):
 
                     # 尝试waiting也加入flops约束
                     if self.enable_dcpp and request.is_dcpp and self.attn_estimator is not None:
-                        target_tokens = min(token_budget.get_flops(), self.max_num_scheduled_flops)
                         dcpp_equitable_tokens = num_new_tokens
+                        
+                        # # 优先使用上次实际耗时作为目标 (最直接的自适应方案)
+                        # if (self.attn_estimator._ekf_initialized and 
+                        #     self._last_actual_execution_time > 0):
+                        #     target_time = self._last_actual_execution_time
+                        #     if token_budget.is_time_budget_mode():
+                        #         remaining_time = token_budget.get_time()
+                        #         target_time = min(remaining_time, target_time) if remaining_time > 0 else target_time
+                            
+                        #     num_new_tokens = self.attn_estimator.compute_chunk_size_from_target_time(
+                        #         num_computed_tokens,
+                        #         target_time,
+                        #         self.cache_config.block_size
+                        #     )
+                        #     dcpp_scheduled_chunk = num_new_tokens
+                        # elif self.dcpp_target_execution_time > 0:
+                        #     num_new_tokens = self.attn_estimator.compute_chunk_size_from_target_time(
+                        #         num_computed_tokens,
+                        #         self.dcpp_target_execution_time,
+                        #         self.cache_config.block_size
+                        #     )
+                        #     dcpp_scheduled_chunk = num_new_tokens
+                        # else:
+                        # Fallback: 使用FLOPs目标值
+                        print(f"max_flops {self.max_num_scheduled_flops}, actual flops {token_budget.get_flops()}")
+                        target_tokens = min(token_budget.get_flops(), self.max_num_scheduled_flops)
                         num_new_tokens, dcpp_scheduled_chunk = \
                                 self.attn_estimator.compute_chunk_size_with_flops(
                                     num_computed_tokens,
@@ -843,10 +934,10 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
 
-                # print(f"======================================waiting===============================================")
-                # print(f"===================================num_new_tokens:{num_new_tokens}|request.num_computed_tokens:{request.num_computed_tokens}")
+                logger.info(f"======================================waiting===============================================")
+                logger.info(f"===================================num_new_tokens:{num_new_tokens}|request.num_computed_tokens:{request.num_computed_tokens}")
                 token_budget.consume(num_new_tokens, num_computed_tokens, False)
-                # print(f"===================================token_budget.get():{token_budget.get()}")
+                logger.info(f"===================================token_budget.get():{token_budget.get()}")
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -969,6 +1060,19 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        
+        # 记录本次调度的预估总耗时 (供EKF更新使用)
+        # 在TIME模式下，consumed_time是累计的预估时间
+        # 在CL模式下，根据flops计算预估时间
+        if token_budget.is_time_budget_mode():
+            self._last_scheduled_estimated_time = token_budget.get_consumed_time()
+        elif self.attn_estimator is not None and self.attn_estimator._ekf_initialized:
+            # CL模式下，使用k参数将消耗的flops转换为时间
+            consumed_flops = self.max_num_scheduled_flops - token_budget.get_flops()
+            self._last_scheduled_estimated_time = self.attn_estimator.k * consumed_flops
+        else:
+            self._last_scheduled_estimated_time = 0.0
+        
         return scheduler_output
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:

@@ -186,6 +186,8 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+    
+    execution_time_ms: float = 0.0
 
 
 # ModelRunnerOutput wrapper for async scheduling.

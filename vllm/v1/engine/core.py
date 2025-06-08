@@ -372,12 +372,12 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -387,6 +387,15 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        
+        # 从ModelRunnerOutput获取精确的执行时间（毫秒转秒）
+        elapsed_time = 0.0
+        if hasattr(model_output, 'execution_time_ms') and model_output.execution_time_ms > 0:
+            elapsed_time = model_output.execution_time_ms / 1000.0
+        
+        # 只有当有有效的执行时间时才记录
+        if elapsed_time > 0:
+            self._record_execution_timing(scheduler_output, elapsed_time)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -492,6 +501,7 @@ class EngineCore:
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
+                    print(">>>>>>>>>>>>>>> I will sample tokens")
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
@@ -508,6 +518,7 @@ class EngineCore:
                     and len(batch_queue) < self.batch_queue_size
                     and not batch_queue[-1][0].done()
                 ):
+                    logger.info(">>>>>>>>>>>> NO PENDING <<<<<<<<<")
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
                     return None, True
@@ -530,6 +541,15 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+
+        
+        # 从ModelRunnerOutput获取精确的执行时间（毫秒转秒）
+        elapsed_time = 0.0
+        if hasattr(model_output, 'execution_time_ms') and model_output.execution_time_ms > 0:
+            elapsed_time = model_output.execution_time_ms / 1000.0
+        # 只有当有有效的执行时间时才记录
+        if elapsed_time > 0:
+            self._record_execution_timing(scheduler_output, elapsed_time)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -563,6 +583,110 @@ class EngineCore:
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
+    
+    def _record_execution_timing(self, scheduler_output, elapsed_time: float) -> None:
+        """Record execution timing for dynamic calibration of chunk size estimation.
+        
+        Collects (chunk_size, hist_seq_len) for each scheduled request and uses
+        batch-level EKF update to calibrate parameters based on total elapsed time.
+        
+        Args:
+            scheduler_output: The scheduler output containing execution info
+            elapsed_time: Elapsed time in seconds from submit to completion
+        """
+        # Get the estimator from scheduler if available (named 'attn_estimator' in scheduler)
+        estimator = getattr(self.scheduler, 'attn_estimator', None)
+        if estimator is None:
+            return
+        
+        try:
+            # Get total scheduled tokens
+            total_tokens = getattr(scheduler_output, 'total_num_scheduled_tokens', 0)
+            if total_tokens <= 0:
+                return
+            
+            # 收集每条请求的 (chunk_size, hist_seq_len)
+            # num_scheduled_tokens 记录了每个请求调度的token数
+            num_scheduled_tokens = getattr(scheduler_output, 'num_scheduled_tokens', {})
+            
+            request_chunks = []  # List of (chunk_size, hist_seq_len)
+            
+            # Process new requests
+            new_reqs = getattr(scheduler_output, 'scheduled_new_reqs', [])
+            for req in new_reqs:
+                req_id = getattr(req, 'request_id', None) or getattr(req, 'req_id', None)
+                if req_id and req_id in num_scheduled_tokens:
+                    chunk_size = num_scheduled_tokens[req_id]
+                    hist_seq_len = getattr(req, 'num_computed_tokens', 0)
+                    if chunk_size > 0:
+                        request_chunks.append((chunk_size, hist_seq_len))
+            
+            # Process cached requests
+            cached_reqs = getattr(scheduler_output, 'scheduled_cached_reqs', None)
+            if cached_reqs is not None:
+                req_ids = getattr(cached_reqs, 'req_ids', [])
+                computed_tokens_list = getattr(cached_reqs, 'num_computed_tokens', [])
+                
+                for i, req_id in enumerate(req_ids):
+                    if req_id in num_scheduled_tokens:
+                        chunk_size = num_scheduled_tokens[req_id]
+                        hist_seq_len = computed_tokens_list[i] if i < len(computed_tokens_list) else 0
+                        if chunk_size > 0:
+                            request_chunks.append((chunk_size, hist_seq_len))
+            
+            if not request_chunks:
+                # Fallback: 如果无法获取详细信息，使用总token数和0作为近似
+                request_chunks = [(total_tokens, 0)]
+            
+            # 使用调度时计算的预估总耗时进行日志对比
+            predicted_time = getattr(self.scheduler, '_last_scheduled_estimated_time', 0.0)
+            
+            # Check if EKF was not initialized before this call
+            was_ekf_initialized = estimator._ekf_initialized
+            
+            # Log predicted vs actual time for debugging
+            if was_ekf_initialized and predicted_time > 0 and logger.isEnabledFor(DEBUG):
+                time_error = elapsed_time - predicted_time
+                error_pct = abs(time_error / elapsed_time * 100) if elapsed_time > 0 else 0
+                logger.debug(
+                    "Execution timing: N=%d, total_chunk=%d, predicted=%.4fs, "
+                    "actual=%.4fs, error=%.4fs (%.1f%%)",
+                    len(request_chunks), total_tokens, predicted_time, 
+                    elapsed_time, time_error, error_pct
+                )
+            
+            # 使用batch级别的EKF更新
+            estimator.record_batch_execution_time(request_chunks, elapsed_time)
+            
+            # 记录实际执行耗时，作为下次调度的目标耗时
+            # 这是最直接的自适应方案：用实际耗时指导下次调度
+            if self.scheduler._last_actual_execution_time == 0:
+                self.scheduler._last_actual_execution_time = elapsed_time
+            if len(self.scheduler._target_time_list) < 2:
+                self.scheduler._target_time_list.append(elapsed_time)
+                self.scheduler._last_actual_execution_time = elapsed_time
+            
+            # 如果time_budget还未设置，在EKF初始化后自动设置
+            if not was_ekf_initialized and estimator._ekf_initialized:
+                token_budget = getattr(self.scheduler, 'token_budget', None)
+                if token_budget is not None and token_budget.get_max_time() <= 0:
+                    # 用当前实际耗时的1.2倍作为初始time_budget上限
+                    token_budget.set_max_time_budget(elapsed_time * 1.2)
+                    logger.info(
+                        "EKF initialized. Set time budget: max=%.4f seconds "
+                        "(based on actual execution time %.4fs)",
+                        elapsed_time * 1.2, elapsed_time
+                    )
+            
+            # Update hist_seq_len tracking for next iteration
+            total_hist = sum(h for c, h in request_chunks)
+            avg_hist = total_hist // len(request_chunks) if request_chunks else 0
+            self.scheduler._timing_hist_seq_len = avg_hist + total_tokens
+            
+        except (AttributeError, TypeError) as e:
+            # Log debug info if attributes are not available
+            logger.debug("Failed to record execution timing: %s", str(e))
+    
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
