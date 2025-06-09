@@ -58,9 +58,16 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.model_executor.flops_estimator import create_estimator_safely
+from vllm.v1.core.sched.profiling_chunk_predictor import ProfilingChunkManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# Environment variable to enable profiling-based dynamic chunk sizing
+# This is an alternative to the FLOPs-based DCPP approach
+VLLM_PROFILING_CHUNK_ENABLED = os.environ.get(
+    "VLLM_PROFILING_CHUNK_ENABLED", ""
+).lower() in ("1", "true", "yes")
 
 
 class Scheduler(SchedulerInterface):
@@ -365,6 +372,167 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+        # Profiling-based dynamic chunk sizing (alternative to FLOPs-based DCPP)
+        # Enable via VLLM_PROFILING_CHUNK_ENABLED=1
+        self.profiling_chunk_enabled = VLLM_PROFILING_CHUNK_ENABLED
+        self.profiling_chunk_manager: ProfilingChunkManager | None = None
+        self._profiling_chunk_initialized = False
+        
+        if self.profiling_chunk_enabled:
+            base_chunk_size = self.scheduler_config.long_prefill_token_threshold
+            if base_chunk_size <= 0:
+                base_chunk_size = self.max_num_scheduled_tokens
+            
+            self.profiling_chunk_manager = ProfilingChunkManager(
+                base_chunk_size=base_chunk_size,
+                page_size=self.block_size,
+                context_len=self.max_model_len,
+                max_prefill_tokens=self.max_num_scheduled_tokens,
+            )
+            logger.info(
+                "[ProfilingChunk] Enabled. base_chunk=%d, page_size=%d",
+                base_chunk_size, self.block_size
+            )
+
+    def run_profiling_chunk_init(
+        self,
+        model_executor = None,
+    ) -> None:
+        """
+        Run profiling to initialize dynamic chunk predictor.
+        
+        Should be called during engine initialization, after model_executor is ready.
+        
+        Args:
+            model_executor: The model executor for running actual forward passes.
+                           If None, falls back to dummy profiling on first schedule().
+        """
+        if self._profiling_chunk_initialized or not self.profiling_chunk_enabled:
+            return
+        
+        self._profiling_chunk_initialized = True  # Mark as done to prevent retry
+        
+        if self.profiling_chunk_manager is None:
+            return
+        
+        if model_executor is None:
+            logger.warning("[ProfilingChunk] No model_executor provided, skipping profiling")
+            return
+        
+        logger.info("[ProfilingChunk] Running startup profiling with real model forward...")
+        
+        import time
+        from typing import List
+        
+        seq_lens: List[int] = []
+        latencies: List[float] = []
+        
+        base_chunk_size = self.profiling_chunk_manager.base_chunk_size
+        num_samples = 64
+        logger.info(f">>>>>>>>>>>>base_chunk_size {base_chunk_size}")
+        
+        # Profile different chunk sizes using real model forward
+        # Note: In PP mode, collective_rpc runs on all workers but we only need
+        # the result from one worker (driver/rank 0). The execution on all workers
+        # is still necessary to keep them synchronized.
+        for i in range(num_samples + 1):
+            chunk_size = int(
+                base_chunk_size
+                - (i - 1) * (base_chunk_size / num_samples)
+            )
+            logger.info(f">>>>>>>>>>> profile seq_len {seq_lens}: lantency: {latencies}")
+            if chunk_size <= 0:
+                break
+            
+            try:
+                # Call worker's profile_prefill_latency via collective_rpc
+                # This runs the real model forward on all workers
+                # Use unique_reply_rank=0 to only get result from driver worker
+                # (this also handles TP since driver is typically TP rank 0)
+                kwargs = {}
+                if hasattr(model_executor, 'collective_rpc'):
+                    # Check if unique_reply_rank is supported
+                    import inspect
+                    sig = inspect.signature(model_executor.collective_rpc)
+                    if 'unique_reply_rank' in sig.parameters:
+                        pc = self.vllm_config.parallel_config
+                        output_rank = (
+                            pc.world_size
+                            - pc.tensor_parallel_size
+                            * pc.prefill_context_parallel_size
+                        )
+                        kwargs['unique_reply_rank'] = output_rank
+                
+                result = model_executor.collective_rpc(
+                    "profile_prefill_latency",
+                    args=(chunk_size,),
+                    **kwargs,
+                )
+
+                if i == 0:
+                    continue
+                
+                # Get latency - result format depends on unique_reply_rank
+                if isinstance(result, (int, float)):
+                    latency_ms = float(result)
+                elif isinstance(result, list) and len(result) > 0:
+                    latency_ms = float(result[0])
+                else:
+                    continue
+                    
+                seq_lens.append(chunk_size)
+                latencies.append(latency_ms)
+                    
+            except Exception as e:
+                logger.debug("[ProfilingChunk] Forward failed for chunk=%d: %s", chunk_size, e)
+                continue
+        
+        if len(seq_lens) < 8:
+            logger.warning(
+                "[ProfilingChunk] Profiling failed: only %d samples collected",
+                len(seq_lens)
+            )
+            return
+        
+        logger.info(
+            "[ProfilingChunk] Collected %d samples. Latency range: [%.2f, %.2f] ms",
+            len(seq_lens), min(latencies), max(latencies)
+        )
+        
+        # Fit model and set target latency
+        if self.profiling_chunk_manager.predictor.fit(seq_lens, latencies):
+            self.profiling_chunk_manager.predictor.set_target_latency(base_chunk_size)
+            self.profiling_chunk_manager.predictor.is_ready = True
+            self.profiling_chunk_manager._profiling_done = True
+            logger.info(
+                "[ProfilingChunk] Profiling complete. Target latency: %.2f ms",
+                self.profiling_chunk_manager.predictor.target_latency or 0
+            )
+        else:
+            logger.warning("[ProfilingChunk] Model fitting failed, using default chunking")
+
+        # # Profiling-based dynamic chunk sizing (alternative to FLOPs-based DCPP)
+        # # Enable via VLLM_PROFILING_CHUNK_ENABLED=1
+        # self.profiling_chunk_enabled = VLLM_PROFILING_CHUNK_ENABLED
+        # self.profiling_chunk_manager: ProfilingChunkManager | None = None
+        # # self._profiling_chunk_initialized = False
+        
+        # if self.profiling_chunk_enabled:
+        #     base_chunk_size = self.scheduler_config.long_prefill_token_threshold
+        #     if base_chunk_size <= 0:
+        #         base_chunk_size = self.max_num_scheduled_tokens
+            
+        #     self.profiling_chunk_manager = ProfilingChunkManager(
+        #         base_chunk_size=base_chunk_size,
+        #         page_size=self.block_size,
+        #         context_len=self.max_model_len,
+        #         max_prefill_tokens=self.max_num_scheduled_tokens,
+        #     )
+        #     logger.info(
+        #         "[ProfilingChunk] Enabled. base_chunk=%d, page_size=%d",
+        #         base_chunk_size, self.block_size
+        #     )
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -376,6 +544,11 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+
+        # Run profiling-based chunk initialization on first call (fallback if not done during init)
+        if self.profiling_chunk_enabled and not self._profiling_chunk_initialized:
+            self.run_profiling_chunk_init()
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -434,11 +607,14 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget.get())
+
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
             num_new_tokens = min(
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
+            )
+            num_new_tokens = min(
+                num_new_tokens, self.max_num_scheduled_tokens
             )
 
             # Schedule encoder inputs.
@@ -458,10 +634,21 @@ class Scheduler(SchedulerInterface):
                     encoder_compute_budget,
                     shift_computed_tokens=1 if self.use_eagle else 0,
                 )
-            # print(f"======================================running===============================================")
+            print(f"======================================running===============================================")
             # print(f"=====================self.enable_dcpp:{self.enable_dcpp}|request.is_dcpp:{request.is_dcpp}")
             # print(f"=====================request.num_tokens:{request.num_tokens}|request.num_computed_tokens:{request.num_computed_tokens}|request.dcpp_scheduled_chunk:{request.dcpp_scheduled_chunk}|token_budget:{token_budget.get_flops()}")
-            if self.enable_dcpp and request.is_dcpp and self.attn_estimator is not None:
+            # Profiling-based dynamic chunk sizing (alternative to DCPP)
+            if (self.profiling_chunk_enabled 
+                and self.profiling_chunk_manager is not None 
+                and self.profiling_chunk_manager.is_ready
+                and num_new_tokens > 1):
+                predicted_chunk = self.profiling_chunk_manager.predict_chunk_size(
+                    history_len=request.num_computed_tokens
+                )
+                if predicted_chunk is not None and predicted_chunk > 0:
+                    num_new_tokens = min(num_new_tokens, predicted_chunk)
+            # FLOPs-based DCPP (original vLLM approach)
+            elif self.enable_dcpp and request.is_dcpp and self.attn_estimator is not None:
                 # 后续可以做到budget里面
                 dcpp_equitable_tokens = num_new_tokens
                 
@@ -505,7 +692,6 @@ class Scheduler(SchedulerInterface):
                 # 1.dcpp 2.chunk_size 3.request需要计算的 4.floor
                 # NOTE: Prevent short tail effect
                 floor = self.dcpp_min_chunk if self.dcpp_min_chunk and self.dcpp_min_chunk > 0 else 0
-                print(">>>>>>>>>>>dcpp_equitable_tokens", dcpp_equitable_tokens)
                 num_new_tokens = min(num_new_tokens, dcpp_equitable_tokens)
                 num_new_tokens = min(request.num_tokens - request.num_computed_tokens,
                                      max(floor, num_new_tokens))
@@ -784,8 +970,18 @@ class Scheduler(SchedulerInterface):
                         # we can stop the scheduling here.
                         break
 
-                    # 尝试waiting也加入flops约束
-                    if self.enable_dcpp and request.is_dcpp and self.attn_estimator is not None:
+                    # Profiling-based dynamic chunk sizing for WAITING requests
+                    if (self.profiling_chunk_enabled 
+                        and self.profiling_chunk_manager is not None 
+                        and self.profiling_chunk_manager.is_ready
+                        and num_new_tokens > 1):
+                        predicted_chunk = self.profiling_chunk_manager.predict_chunk_size(
+                            history_len=num_computed_tokens
+                        )
+                        if predicted_chunk is not None and predicted_chunk > 0:
+                            num_new_tokens = min(num_new_tokens, predicted_chunk)
+                    # FLOPs-based DCPP for WAITING requests
+                    elif self.enable_dcpp and request.is_dcpp and self.attn_estimator is not None:
                         dcpp_equitable_tokens = num_new_tokens
                         
                         # # 优先使用上次实际耗时作为目标 (最直接的自适应方案)
@@ -802,22 +998,21 @@ class Scheduler(SchedulerInterface):
                         #         self.cache_config.block_size
                         #     )
                         #     dcpp_scheduled_chunk = num_new_tokens
-                        # elif self.dcpp_target_execution_time > 0:
-                        #     num_new_tokens = self.attn_estimator.compute_chunk_size_from_target_time(
-                        #         num_computed_tokens,
-                        #         self.dcpp_target_execution_time,
-                        #         self.cache_config.block_size
-                        #     )
-                        #     dcpp_scheduled_chunk = num_new_tokens
-                        # else:
-                        # Fallback: 使用FLOPs目标值
-                        print(f"max_flops {self.max_num_scheduled_flops}, actual flops {token_budget.get_flops()}")
-                        target_tokens = min(token_budget.get_flops(), self.max_num_scheduled_flops)
-                        num_new_tokens, dcpp_scheduled_chunk = \
-                                self.attn_estimator.compute_chunk_size_with_flops(
-                                    num_computed_tokens,
-                                    target_tokens,
-                                    self.cache_config.block_size)
+                        if self.dcpp_target_execution_time > 0:
+                            num_new_tokens = self.attn_estimator.compute_chunk_size_from_target_time(
+                                num_computed_tokens,
+                                self.dcpp_target_execution_time,
+                                self.cache_config.block_size
+                            )
+                            dcpp_scheduled_chunk = num_new_tokens
+                        else:
+                            # Fallback: 使用FLOPs目标值
+                            target_tokens = min(token_budget.get_flops(), self.max_num_scheduled_flops)
+                            num_new_tokens, dcpp_scheduled_chunk = \
+                                    self.attn_estimator.compute_chunk_size_with_flops(
+                                        num_computed_tokens,
+                                        target_tokens,
+                                        self.cache_config.block_size)
 
                         # 1.dcpp 2.chunk_size 3.request需要计算的 4.floor
                         # NOTE: Prevent short tail effect

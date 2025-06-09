@@ -189,6 +189,8 @@ class ModelRunnerOutput:
     
     execution_time_ms: float = 0.0
 
+    execution_time_ms: float = 0.0
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

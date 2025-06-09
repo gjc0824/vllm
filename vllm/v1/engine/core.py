@@ -208,6 +208,14 @@ class EngineCore:
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
+
+        # Run profiling-based chunk initialization if enabled
+        # This should be done after model_executor is initialized and before serving
+        if hasattr(self.scheduler, 'run_profiling_chunk_init'):
+            self.scheduler.run_profiling_chunk_init(
+                model_executor=self.model_executor,
+            )
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
@@ -366,6 +374,194 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    def _record_execution_timing(self, scheduler_output, elapsed_time: float) -> None:
+        """Record execution timing for dynamic calibration of chunk size estimation.
+        
+        Collects (chunk_size, hist_seq_len) for each scheduled request and uses
+        batch-level EKF update to calibrate parameters based on total elapsed time.
+        
+        Args:
+            scheduler_output: The scheduler output containing execution info
+            elapsed_time: Elapsed time in seconds from submit to completion
+        """
+        # Get the estimator from scheduler if available (named 'attn_estimator' in scheduler)
+        profiling_chunk_manager = getattr(self.scheduler, 'profiling_chunk_manager', None)
+        if profiling_chunk_manager is None:
+            return
+        
+        try:
+            # Get total scheduled tokens
+            total_tokens = getattr(scheduler_output, 'total_num_scheduled_tokens', 0)
+            if total_tokens <= 0:
+                return
+            
+            # 收集每条请求的 (chunk_size, hist_seq_len)
+            # num_scheduled_tokens 记录了每个请求调度的token数
+            num_scheduled_tokens = getattr(scheduler_output, 'num_scheduled_tokens', {})
+            
+            request_chunks = []  # List of (chunk_size, hist_seq_len)
+            
+            # Process new requests
+            new_reqs = getattr(scheduler_output, 'scheduled_new_reqs', [])
+            for req in new_reqs:
+                req_id = getattr(req, 'request_id', None) or getattr(req, 'req_id', None)
+                if req_id and req_id in num_scheduled_tokens:
+                    chunk_size = num_scheduled_tokens[req_id]
+                    hist_seq_len = getattr(req, 'num_computed_tokens', 0)
+                    if chunk_size > 0:
+                        request_chunks.append((chunk_size, hist_seq_len))
+            
+            # Process cached requests
+            cached_reqs = getattr(scheduler_output, 'scheduled_cached_reqs', None)
+            if cached_reqs is not None:
+                req_ids = getattr(cached_reqs, 'req_ids', [])
+                computed_tokens_list = getattr(cached_reqs, 'num_computed_tokens', [])
+                
+                for i, req_id in enumerate(req_ids):
+                    if req_id in num_scheduled_tokens:
+                        chunk_size = num_scheduled_tokens[req_id]
+                        hist_seq_len = computed_tokens_list[i] if i < len(computed_tokens_list) else 0
+                        if chunk_size > 0:
+                            request_chunks.append((chunk_size, hist_seq_len))
+            
+            if not request_chunks:
+                # Fallback: 如果无法获取详细信息，使用总token数和0作为近似
+                request_chunks = [(total_tokens, 0)]
+            
+            # Check if profiling chunk manager was not initialized before this call
+            profiling_init = profiling_chunk_manager.is_ready
+            
+            # Log predicted vs actual time for debugging
+            if profiling_init and logger.isEnabledFor(DEBUG):
+                logger.debug(
+                    "Execution timing: N=%d, total_chunk=%d, actual=%.4fs",
+                    len(request_chunks), total_tokens, elapsed_time
+                )
+            
+            # 使用batch级别的拟合
+            if not profiling_chunk_manager.predictor.history_fitted:
+                if not profiling_chunk_manager.record_batch_execution_time(
+                    request_chunks, elapsed_time):
+                    profiling_chunk_manager.with_history_ready = False
+            
+            # # 记录实际执行耗时，作为下次调度的目标耗时
+            # # 这是最直接的自适应方案：用实际耗时指导下次调度
+            # if self.scheduler._last_actual_execution_time == 0:
+            #     self.scheduler._last_actual_execution_time = elapsed_time
+            # if len(self.scheduler._target_time_list) < 2:
+            #     self.scheduler._target_time_list.append(elapsed_time)
+            #     self.scheduler._last_actual_execution_time = elapsed_time
+            
+            # # 如果time_budget还未设置，在EKF初始化后自动设置
+            # if not was_ekf_initialized and estimator._ekf_initialized:
+            #     token_budget = getattr(self.scheduler, 'token_budget', None)
+            #     if token_budget is not None and token_budget.get_max_time() <= 0:
+            #         # 用当前实际耗时的1.2倍作为初始time_budget上限
+            #         token_budget.set_max_time_budget(elapsed_time * 1.2)
+            #         logger.info(
+            #             "EKF initialized. Set time budget: max=%.4f seconds "
+            #             "(based on actual execution time %.4fs)",
+            #             elapsed_time * 1.2, elapsed_time
+            #         )
+            
+        except (AttributeError, TypeError) as e:
+            # Log debug info if attributes are not available
+            logger.debug("Failed to record execution timing: %s", str(e))
+
+    def _record_execution_timing(self, scheduler_output, elapsed_time: float) -> None:
+        """Record execution timing for dynamic calibration of chunk size estimation.
+        
+        Collects (chunk_size, hist_seq_len) for each scheduled request and uses
+        batch-level EKF update to calibrate parameters based on total elapsed time.
+        
+        Args:
+            scheduler_output: The scheduler output containing execution info
+            elapsed_time: Elapsed time in seconds from submit to completion
+        """
+        # Get the estimator from scheduler if available (named 'attn_estimator' in scheduler)
+        profiling_chunk_manager = getattr(self.scheduler, 'profiling_chunk_manager', None)
+        if profiling_chunk_manager is None:
+            return
+        
+        try:
+            # Get total scheduled tokens
+            total_tokens = getattr(scheduler_output, 'total_num_scheduled_tokens', 0)
+            if total_tokens <= 0:
+                return
+            
+            # 收集每条请求的 (chunk_size, hist_seq_len)
+            # num_scheduled_tokens 记录了每个请求调度的token数
+            num_scheduled_tokens = getattr(scheduler_output, 'num_scheduled_tokens', {})
+            
+            request_chunks = []  # List of (chunk_size, hist_seq_len)
+            
+            # Process new requests
+            new_reqs = getattr(scheduler_output, 'scheduled_new_reqs', [])
+            for req in new_reqs:
+                req_id = getattr(req, 'request_id', None) or getattr(req, 'req_id', None)
+                if req_id and req_id in num_scheduled_tokens:
+                    chunk_size = num_scheduled_tokens[req_id]
+                    hist_seq_len = getattr(req, 'num_computed_tokens', 0)
+                    if chunk_size > 0:
+                        request_chunks.append((chunk_size, hist_seq_len))
+            
+            # Process cached requests
+            cached_reqs = getattr(scheduler_output, 'scheduled_cached_reqs', None)
+            if cached_reqs is not None:
+                req_ids = getattr(cached_reqs, 'req_ids', [])
+                computed_tokens_list = getattr(cached_reqs, 'num_computed_tokens', [])
+                
+                for i, req_id in enumerate(req_ids):
+                    if req_id in num_scheduled_tokens:
+                        chunk_size = num_scheduled_tokens[req_id]
+                        hist_seq_len = computed_tokens_list[i] if i < len(computed_tokens_list) else 0
+                        if chunk_size > 0:
+                            request_chunks.append((chunk_size, hist_seq_len))
+            
+            if not request_chunks:
+                # Fallback: 如果无法获取详细信息，使用总token数和0作为近似
+                request_chunks = [(total_tokens, 0)]
+            
+            # Check if profiling chunk manager was not initialized before this call
+            profiling_init = profiling_chunk_manager.is_ready
+            
+            # Log predicted vs actual time for debugging
+            if profiling_init and logger.isEnabledFor(DEBUG):
+                logger.debug(
+                    "Execution timing: N=%d, total_chunk=%d, actual=%.4fs",
+                    len(request_chunks), total_tokens, elapsed_time
+                )
+            
+            # 使用batch级别的拟合
+            if not profiling_chunk_manager.predictor.history_fitted:
+                if not profiling_chunk_manager.record_batch_execution_time(
+                    request_chunks, elapsed_time):
+                    profiling_chunk_manager.with_history_ready = False
+            
+            # # 记录实际执行耗时，作为下次调度的目标耗时
+            # # 这是最直接的自适应方案：用实际耗时指导下次调度
+            # if self.scheduler._last_actual_execution_time == 0:
+            #     self.scheduler._last_actual_execution_time = elapsed_time
+            # if len(self.scheduler._target_time_list) < 2:
+            #     self.scheduler._target_time_list.append(elapsed_time)
+            #     self.scheduler._last_actual_execution_time = elapsed_time
+            
+            # # 如果time_budget还未设置，在EKF初始化后自动设置
+            # if not was_ekf_initialized and estimator._ekf_initialized:
+            #     token_budget = getattr(self.scheduler, 'token_budget', None)
+            #     if token_budget is not None and token_budget.get_max_time() <= 0:
+            #         # 用当前实际耗时的1.2倍作为初始time_budget上限
+            #         token_budget.set_max_time_budget(elapsed_time * 1.2)
+            #         logger.info(
+            #             "EKF initialized. Set time budget: max=%.4f seconds "
+            #             "(based on actual execution time %.4fs)",
+            #             elapsed_time * 1.2, elapsed_time
+            #         )
+            
+        except (AttributeError, TypeError) as e:
+            # Log debug info if attributes are not available
+            logger.debug("Failed to record execution timing: %s", str(e))
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -501,7 +697,6 @@ class EngineCore:
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
-                    print(">>>>>>>>>>>>>>> I will sample tokens")
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
