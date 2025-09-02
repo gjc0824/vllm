@@ -134,6 +134,18 @@ class SchedulerConfig:
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
     """
+    
+    # --- DCPP (Dynamic Chunked Prefill Planning) ---
+    enable_dcpp: bool = False
+    """EXPERIMENTAL: Enable dynamic chunked prefill planning (DCPP)."""
+
+    dcpp_min_chunk: Optional[int] = None
+    """Minimum prefill chunk size when DCPP is enabled. If None, a backend
+    specific default will be used."""
+
+    dcpp_length_threshold: int = 0
+    """Input length threshold to trigger DCPP logic. Requests with prompt
+    length below this value will not use DCPP even if enabled."""
 
     stream_interval: int = Field(default=1, ge=1)
     """The interval (or buffer size) for streaming in terms of token length.

@@ -74,6 +74,8 @@ class Request:
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
+        is_dcpp: Optional[bool] = False,
+        dcpp_scheduled_chunk: Optional[int] = 0
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -150,6 +152,9 @@ class Request:
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted
         self.num_nans_in_logits = 0
+
+        self.is_dcpp = is_dcpp
+        self.dcpp_scheduled_chunk = dcpp_scheduled_chunk
 
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0

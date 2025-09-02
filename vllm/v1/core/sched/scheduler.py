@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import time
+import os
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
@@ -55,6 +56,7 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.model_executor.flops_estimator import create_estimator_safely
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
@@ -227,6 +229,13 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        
+        # DCPP estimator init (experimental): prefer in-memory hf_config, fallback to disk
+        self.attn_estimator = None
+        self.enable_dcpp = self.scheduler_config.enable_dcpp
+        self.dcpp_length_threshold = self.scheduler_config.dcpp_length_threshold
+        self.dcpp_min_chunk = self.scheduler_config.dcpp_min_chunk or 0
+        self._maybe_init_dcpp(vllm_config)
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
         def has_mamba_layers(kv_cache_config: KVCacheConfig) -> bool:
@@ -342,7 +351,11 @@ class Scheduler(SchedulerInterface):
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
+            dcpp_equitable_tokens = None
             request = self.running[req_index]
+
+            if request.num_tokens - request.num_computed_tokens < request.dcpp_scheduled_chunk:
+                request.is_dcpp = False
 
             # do not schedule another step for the same request while it still has
             # output placeholders for PP.
@@ -399,6 +412,27 @@ class Scheduler(SchedulerInterface):
                     encoder_compute_budget,
                     shift_computed_tokens=1 if self.use_eagle else 0,
                 )
+
+            if self.enable_dcpp and request.is_dcpp and self.attn_estimator is not None:
+                # Shorten length to reduce long kv history effect
+                # Target execution time is num_new_tokens execution time without history
+                dcpp_equitable_tokens = num_new_tokens
+                target_tokens = self.scheduler_config.long_prefill_token_threshold \
+                    if self.scheduler_config.long_prefill_token_threshold > 0 else token_budget
+                num_new_tokens, dcpp_scheduled_chunk = self.attn_estimator.compute_chunk_size_with_overhead(
+                                                                        request.num_computed_tokens,
+                                                                        request.num_tokens,
+                                                                        target_tokens,
+                                                                        self.cache_config.block_size)
+                # NOTE: Prevent short tail effect
+                floor = self.dcpp_min_chunk if self.dcpp_min_chunk and self.dcpp_min_chunk > 0 else 0
+                num_new_tokens = min(num_new_tokens, dcpp_equitable_tokens)
+                num_new_tokens = min(request.num_tokens - request.num_computed_tokens,
+                                     max(floor, num_new_tokens))
+                request.dcpp_scheduled_chunk = dcpp_scheduled_chunk
+                logger.debug(
+                    "DCPP adjusted chunk from %d to %d (hist=%d, total=%d)",
+                    dcpp_equitable_tokens, num_new_tokens, request.num_computed_tokens, request.num_tokens)
 
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
@@ -483,7 +517,10 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
-            token_budget -= num_new_tokens
+            # NOTE: If dcpp is enabled, use the original chunk size to update token budget but 
+            # keep the shortened chunk size for the request to keep similar execution time between each step.
+            # Otherwise, use the scheduled chunk size
+            token_budget -= (num_new_tokens if dcpp_equitable_tokens is None else dcpp_equitable_tokens)
             req_index += 1
 
             # Speculative decode related.
@@ -647,6 +684,11 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if (self.enable_dcpp and self.attn_estimator is not None
+                            and num_new_tokens > self.dcpp_length_threshold):
+                        logger.debug("Enable DCPP for req %s: tokens=%d threshold=%d",
+                                     request.request_id, num_new_tokens, self.dcpp_length_threshold)
+                        request.is_dcpp = True
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
@@ -1825,6 +1867,29 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
             self.connector.shutdown()
+
+    # -------------------------
+    # DCPP helpers
+    # -------------------------
+    def _maybe_init_dcpp(self, vllm_config: VllmConfig) -> None:
+        """Initialize FLOPs estimator using a helper from flops_estimator.
+        Keeps changes minimal in scheduler; helper handles all fallbacks.
+        """
+        if not self.enable_dcpp:
+            return
+        hf_cfg = (getattr(vllm_config.model_config, "hf_text_config", None)
+                  or getattr(vllm_config.model_config, "hf_config", None))
+        # Prefer HF config object; only use on-disk config.json if model is a
+        # local directory. ModelConfig does not expose `model_path`.
+        model_root = getattr(vllm_config.model_config, "model", None)
+        cfg_path = (os.path.join(model_root, "config.json")
+                    if isinstance(model_root, str) and os.path.isdir(model_root)
+                    else None)
+        self.attn_estimator = create_estimator_safely(
+            hf_config_obj=hf_cfg,
+            config_path=cfg_path,
+            scheduler_config=self.scheduler_config,
+        )
 
     ########################################################################
     # KV Connector Related Methods
