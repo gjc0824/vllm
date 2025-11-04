@@ -29,7 +29,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
-    vllm_kernel_override_batch_invariant,
+    vllm_is_batch_invariant,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -38,12 +38,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils import cdiv, is_pin_memory_available
 from vllm.utils.flashinfer import (
     can_use_trtllm_attention,
     flashinfer_disable_q_quantization,
     use_trtllm_attention,
 )
+from vllm.utils.math_utils import cdiv
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
@@ -267,7 +268,7 @@ class FlashInferMetadata:
     # For cascade attention (CPU for planning).
     use_cascade: bool
 
-    prefill_wrapper: BatchDecodeWithPagedKVCacheWrapper | None = None
+    prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper | None = None
     decode_wrapper: BatchDecodeWithPagedKVCacheWrapper | None = None
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None = None
 
@@ -296,7 +297,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self._prefill_wrapper = None  # Wrapper for prefill/append
         self._decode_wrapper = None  # Wrapper for decode (general shape)
 
-        if vllm_kernel_override_batch_invariant():
+        if vllm_is_batch_invariant():
             self.decode_fixed_split_size = 2048
             self.prefill_fixed_split_size = 4096
             self.disable_split_kv = True
@@ -328,7 +329,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             ] = {}
             self._decode_cudagraph_max_bs = min(
                 (1 + num_spec_tokens) * max_num_reqs,
-                self.compilation_config.max_capture_size,
+                self.compilation_config.max_cudagraph_capture_size,
             )
 
         try:
@@ -420,7 +421,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_workspace_buffer(self):
         if self._workspace_buffer is None:
             buffer_size = FLASHINFER_WORKSPACE_BUFFER_SIZE
-            if vllm_kernel_override_batch_invariant():
+            if vllm_is_batch_invariant():
                 buffer_size = FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT
             self._workspace_buffer = torch.zeros(
                 buffer_size, dtype=torch.uint8, device=self.device
@@ -706,7 +707,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 paged_kv_indptr_cpu = paged_kv_indptr_cpu[prefill_start:]
 
-                
                 # Recompute max_q_len for the slice of requests we are using
                 # for prefills. This can be different from max_q_len when
                 # we have a non-uniform batch with some short decodes offloaded
@@ -915,6 +915,11 @@ class FlashInferImpl(AttentionImpl):
             return False
 
         return self.support_trtllm_attn
+
+    # FlashInfer requires attention sinks to be float32
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        if self.sinks is not None and self.sinks.dtype != torch.float32:
+            self.sinks = self.sinks.to(torch.float32)
 
     def forward(
         self,
