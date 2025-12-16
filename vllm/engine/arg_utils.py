@@ -96,6 +96,9 @@ from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import resolve_kv_cache_dtype_string
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.sample.logits_processor import LogitsProcessor
+from vllm.v1.core.sched.budget import BudgetType, TokenBudget
+
+# yapf: enable
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -581,9 +584,10 @@ class EngineArgs:
     tokens_only: bool = False
 
     enable_dcpp: bool = SchedulerConfig.enable_dcpp
-    dcpp_min_chunk: Optional[int] = SchedulerConfig.dcpp_min_chunk
+    dcpp_min_chunk: int | None = SchedulerConfig.dcpp_min_chunk
     dcpp_length_threshold: int = SchedulerConfig.dcpp_length_threshold
 
+    budget_type: BudgetType = "computational_load"
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1161,6 +1165,8 @@ class EngineArgs:
                                      **scheduler_kwargs["dcpp_min_chunk"])
         scheduler_group.add_argument("--dcpp-length-threshold",
                                      **scheduler_kwargs["dcpp_length_threshold"])
+        scheduler_group.add_argument("--budget-type",
+                                    **scheduler_kwargs["budget_type"])
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
@@ -1667,6 +1673,7 @@ class EngineArgs:
             dcpp_min_chunk=self.dcpp_min_chunk,
             dcpp_length_threshold=self.dcpp_length_threshold,
             stream_interval=self.stream_interval,
+            budget_type=self.budget_type,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

@@ -21,6 +21,7 @@ logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
+BudgetType = Literal["token", "computational_load"]
 
 
 @config
@@ -139,13 +140,21 @@ class SchedulerConfig:
     enable_dcpp: bool = False
     """EXPERIMENTAL: Enable dynamic chunked prefill planning (DCPP)."""
 
-    dcpp_min_chunk: Optional[int] = None
+    dcpp_min_chunk: int | None = None
     """Minimum prefill chunk size when DCPP is enabled. If None, a backend
     specific default will be used."""
 
     dcpp_length_threshold: int = 0
     """Input length threshold to trigger DCPP logic. Requests with prompt
     length below this value will not use DCPP even if enabled."""
+
+    budget_type: BudgetType = "computational_load"
+    """The budget type to use:\n
+    - "token" means each scheduling uses a fixed number of tokens to form a batch.\n
+    - "computational_load" means using computational load as a metric to determine
+        the number of tokens that can be allocated in the current batch during 
+        each scheduling operation.
+    """
 
     stream_interval: int = Field(default=1, ge=1)
     """The interval (or buffer size) for streaming in terms of token length.

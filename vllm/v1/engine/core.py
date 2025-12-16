@@ -992,6 +992,41 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
+        # When using batch_queue (PP mode) and the queue is not full,
+        # if there are no new requests in the waiting queue, wait briefly
+        # to allow input preprocessing to catch up. This helps keep the
+        # pipeline filled and reduces pipeline bubbles.
+        # Note: We check waiting queue (not has_requests) because running
+        # requests may not produce new tokens in the next schedule.
+        # Also check that the oldest future is not done - if it's done,
+        # model execution is fast (likely decode phase), skip waiting to
+        # avoid adding latency.
+        if (
+            self.batch_queue is not None
+            and 0 < len(self.batch_queue) < self.batch_queue_size
+            and self.scheduler.get_request_counts()[1] == 0  # waiting queue empty
+            and not self.batch_queue[-1][0].done()  # oldest future not done (not decode)
+        ):
+            # Wait for a short time to allow preprocessing to complete.
+            # Use multiple short waits to balance latency and throughput.
+            wait_timeout = 0.003  # 3ms per iteration
+            max_wait_iterations = 5  # Up to 15ms total wait
+            for _ in range(max_wait_iterations):
+                try:
+                    req = self.input_queue.get(timeout=wait_timeout)
+                    self._handle_client_request(*req)
+                    # After getting one request, drain remaining ready requests
+                    while not self.input_queue.empty():
+                        req = self.input_queue.get_nowait()
+                        self._handle_client_request(*req)
+                    break
+                except queue.Empty:
+                    # Check if waiting queue has requests or oldest future is done
+                    if (self.scheduler.get_request_counts()[1] > 0
+                            or self.batch_queue[-1][0].done()):
+                        break
+                    continue
+
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
