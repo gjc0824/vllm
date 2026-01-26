@@ -433,8 +433,49 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        import time
+        start_time = time.time()
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            # # When using batch_queue (PP mode) and the queue is not full,
+            # # if there are no new requests in the waiting queue, wait briefly
+            # # to allow input preprocessing to catch up. This helps keep the
+            # # pipeline filled and reduces pipeline bubbles.
+            # # Note: We check waiting queue (not has_requests) because running
+            # # requests may not produce new tokens in the next schedule.
+            # # Also check that the oldest future is not done - if it's done,
+            # # model execution is fast (likely decode phase), skip waiting to
+            # # avoid adding latency.
+            # if (
+            #     self.batch_queue is not None
+            #     and 0 < len(self.batch_queue) < self.batch_queue_size
+            #     and scheduler_output.total_num_scheduled_tokens == 0  # model not executed
+            #     and not batch_queue[-1][0].done()  # oldest future not done (not decode)
+            # ):
+            #     # Wait for a short time to allow preprocessing to complete.
+            #     # Use multiple short waits to balance latency and throughput.
+            #     wait_timeout = 0.001  # 1ms per iteration
+            #     max_wait_iterations = 75  # Up to 75ms total wait
+            #     i = 0
+            #     for _ in range(max_wait_iterations):
+            #         i += 1
+            #         logger.info(f"<<<<<<<< wait counts {i}, len(self.batch_queue) {len(self.batch_queue)}, batch_state {self.batch_queue[-1][0]._state}")
+            #         if self.batch_queue[-1][0].done():
+            #             break
+            #         try:
+            #             req = self.input_queue.get(timeout=wait_timeout)
+            #             self._handle_client_request(*req)
+            #             # After getting one request, drain remaining ready requests
+            #             while not self.input_queue.empty():
+            #                 req = self.input_queue.get_nowait()
+            #                 self._handle_client_request(*req)
+            #         except queue.Empty:
+            #             # Check if waiting queue has requests
+            #             if self.scheduler.get_request_counts()[1] > 0 or self.batch_queue[-1][0].done():
+            #                 break
+            #             continue
+            #     scheduler_output = self.scheduler.schedule()
+
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
@@ -458,7 +499,7 @@ class EngineCore:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
-
+            
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
@@ -991,41 +1032,6 @@ class EngineCoreProc(EngineCore):
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
-
-        # When using batch_queue (PP mode) and the queue is not full,
-        # if there are no new requests in the waiting queue, wait briefly
-        # to allow input preprocessing to catch up. This helps keep the
-        # pipeline filled and reduces pipeline bubbles.
-        # Note: We check waiting queue (not has_requests) because running
-        # requests may not produce new tokens in the next schedule.
-        # Also check that the oldest future is not done - if it's done,
-        # model execution is fast (likely decode phase), skip waiting to
-        # avoid adding latency.
-        if (
-            self.batch_queue is not None
-            and 0 < len(self.batch_queue) < self.batch_queue_size
-            and self.scheduler.get_request_counts()[1] == 0  # waiting queue empty
-            and not self.batch_queue[-1][0].done()  # oldest future not done (not decode)
-        ):
-            # Wait for a short time to allow preprocessing to complete.
-            # Use multiple short waits to balance latency and throughput.
-            wait_timeout = 0.003  # 3ms per iteration
-            max_wait_iterations = 5  # Up to 15ms total wait
-            for _ in range(max_wait_iterations):
-                try:
-                    req = self.input_queue.get(timeout=wait_timeout)
-                    self._handle_client_request(*req)
-                    # After getting one request, drain remaining ready requests
-                    while not self.input_queue.empty():
-                        req = self.input_queue.get_nowait()
-                        self._handle_client_request(*req)
-                    break
-                except queue.Empty:
-                    # Check if waiting queue has requests or oldest future is done
-                    if (self.scheduler.get_request_counts()[1] > 0
-                            or self.batch_queue[-1][0].done()):
-                        break
-                    continue
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""

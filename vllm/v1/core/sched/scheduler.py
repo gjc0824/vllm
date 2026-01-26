@@ -360,7 +360,6 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
-        # print(f"===========================================================================================================")
         while req_index < len(self.running) and token_budget.has_running():
             dcpp_equitable_tokens = None
             request = self.running[req_index]
@@ -398,7 +397,7 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-
+            num_new_tokens = min(num_new_tokens, token_budget.get())
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
             num_new_tokens = min(
@@ -536,7 +535,7 @@ class Scheduler(SchedulerInterface):
                num_computed_tokens = request.num_computed_tokens,
                computed_prompt = request.computed_prompt
             )
-            # print(f"==========================num_new_tokens:{num_new_tokens}|request.num_computed_tokens:{request.num_computed_tokens}|request.num_tokens:{request.num_tokens}|token_budget:{token_budget.get_flops()}")
+            # logger.info(f"==========================num_new_tokens:{num_new_tokens}|request.num_computed_tokens:{request.num_computed_tokens}|request.num_tokens:{request.num_tokens}|token_budget:{token_budget.get_flops()}")
             req_index += 1
 
             # Speculative decode related.
