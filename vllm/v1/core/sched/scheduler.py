@@ -96,6 +96,7 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
+        self._next_batch_id: int = 0
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -858,6 +859,14 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         scheduler_output = SchedulerOutput(
+            batch_id=self._next_batch_id,
+            vpp_enabled=(
+                (self.vllm_config.additional_config or {}).get(
+                    "virtual_pipeline_parallel_size", 1
+                )
+                > 1
+                and self.parallel_config.pipeline_parallel_size > 1
+            ),
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -873,6 +882,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
         )
+        self._next_batch_id += 1
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store

@@ -61,7 +61,7 @@ from vllm.v1.engine.utils import (
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import ModelRunnerOutput, VppContinuationOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
@@ -180,11 +180,19 @@ class EngineCore:
         # to eliminate pipeline bubbles.
         self.batch_queue_size = self.model_executor.max_concurrent_batches
         self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
+            deque[
+                tuple[
+                    Future[ModelRunnerOutput | VppContinuationOutput | None],
+                    SchedulerOutput,
+                    Future[Any],
+                ]
+            ]
+            | None
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        self._deferred_scheduler_output: SchedulerOutput | None = None
 
         self.is_ec_producer = (
             vllm_config.ec_transfer_config is not None
@@ -469,9 +477,12 @@ class EngineCore:
             if not self.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
-            if self.is_pooling_model or not model_executed:
+            if self.is_pooling_model or not model_executed or scheduler_output.vpp_enabled:
                 # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
+                future = cast(
+                    Future[ModelRunnerOutput | VppContinuationOutput | None],
+                    exec_future,
+                )
             else:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
@@ -512,11 +523,43 @@ class EngineCore:
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
+            if isinstance(model_output, VppContinuationOutput):
+                if model_output.kv_connector_output:
+                    self.scheduler._update_from_kv_xfer_finished(
+                        model_output.kv_connector_output
+                    )
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
+                batch_queue.appendleft((exec_future, scheduler_output, exec_future))
+                if (
+                    len(batch_queue) < self.batch_queue_size
+                    and not batch_queue[-1][0].done()
+                ):
+                    return None, True
+                return None, True
             if model_output is None:
-                # None from sample_tokens() implies that the original execute_model()
-                # call failed - raise that exception.
-                exec_model_fut.result()
-                raise RuntimeError("unexpected error")
+                if not scheduler_output.vpp_enabled:
+                    # None from sample_tokens() implies that the original execute_model()
+                    # call failed - raise that exception.
+                    exec_model_fut.result()
+                    raise RuntimeError("unexpected error")
+                if scheduler_output.pending_structured_output_tokens:
+                    self._deferred_scheduler_output = scheduler_output
+                    return None, True
+                grammar_output = self.scheduler.get_grammar_bitmask(
+                    scheduler_output
+                )
+                future = self.model_executor.sample_tokens(
+                    grammar_output, non_block=True
+                )
+                batch_queue.appendleft((future, scheduler_output, exec_model_fut))
+                if (
+                    len(batch_queue) < self.batch_queue_size
+                    and not batch_queue[-1][0].done()
+                ):
+                    return None, True
+                return None, True
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -524,6 +567,10 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+
+        if deferred_scheduler_output is None and self._deferred_scheduler_output is not None:
+            deferred_scheduler_output = self._deferred_scheduler_output
+            self._deferred_scheduler_output = None
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -1426,7 +1473,22 @@ class DPEngineCoreProc(EngineCoreProc):
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
-                self.execute_dummy_batch()
+                if self.batch_queue is not None:
+                    # When PP pipeline is active (batch_queue enabled),
+                    # a blocking execute_dummy_batch would drain all
+                    # in-flight futures in futures_queue, destroying
+                    # pipeline overlap. Use non-blocking RPC instead;
+                    # the dummy future will be consumed when the next
+                    # batch_queue entry's future.result() drains the
+                    # futures_queue. Worker-side ordering ensures the
+                    # DP all2all calls still pair up correctly.
+                    self.model_executor.collective_rpc(
+                        "execute_dummy_batch",
+                        unique_reply_rank=self.model_executor.output_rank,
+                        non_block=True,
+                    )
+                else:
+                    self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(

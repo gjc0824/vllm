@@ -182,6 +182,7 @@ class CachedRequestData:
 @bc_linter_include
 @dataclass
 class SchedulerOutput:
+    batch_id: int
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
     # need to re-send it every scheduling step.
@@ -217,6 +218,9 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
+    # Whether VPP is enabled for this batch.
+    vpp_enabled: bool = False
+
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
@@ -241,6 +245,8 @@ class SchedulerOutput:
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
+            batch_id=0,
+            vpp_enabled=False,
             scheduled_new_reqs=[],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens={},

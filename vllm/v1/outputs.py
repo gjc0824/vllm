@@ -196,6 +196,14 @@ class ModelRunnerOutput:
     cudagraph_stats: CUDAGraphStat | None = None
 
 
+@dataclass
+class VppContinuationOutput:
+    """Indicates VPP execution yielded and should be resumed."""
+
+    batch_id: int
+    kv_connector_output: KVConnectorOutput | None = None
+
+
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
     @abstractmethod
