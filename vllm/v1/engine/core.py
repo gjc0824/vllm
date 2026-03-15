@@ -465,11 +465,11 @@ class EngineCore:
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
-        assert len(batch_queue) < self.batch_queue_size
+        can_schedule = len(batch_queue) < self.batch_queue_size
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        if can_schedule and self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
