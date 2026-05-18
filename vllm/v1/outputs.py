@@ -201,6 +201,7 @@ class VppContinuationOutput:
     """Indicates VPP execution yielded and should be resumed."""
 
     batch_id: int
+    next_vp_stage: int = 0
     kv_connector_output: KVConnectorOutput | None = None
 
 

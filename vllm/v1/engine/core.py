@@ -108,6 +108,7 @@ class EngineCore:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
         self.available_gpu_memory_for_kv_cache = -1
+        self.allow_over_batch_queue = False
 
         # Setup KV Caches and update CacheConfig after profiling.
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
@@ -191,7 +192,7 @@ class EngineCore:
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
-            self.batch_queue = deque(maxlen=self.batch_queue_size)
+            self.batch_queue = deque(maxlen=self.batch_queue_size + 2)
         self._deferred_scheduler_output: SchedulerOutput | None = None
 
         self.is_ec_producer = (
@@ -465,7 +466,10 @@ class EngineCore:
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
-        can_schedule = len(batch_queue) < self.batch_queue_size
+        can_schedule = len(batch_queue) < self.batch_queue_size or self.allow_over_batch_queue
+        print(">>>>>>>>>>>>> batch_queue", len(batch_queue), self.allow_over_batch_queue, can_schedule)
+        if self.allow_over_batch_queue:
+            self.allow_over_batch_queue = False
 
         model_executed = False
         deferred_scheduler_output = None
@@ -500,7 +504,9 @@ class EngineCore:
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
+                print("==================== just append len(batch_queue)", len(batch_queue))
                 batch_queue.appendleft((future, scheduler_output, exec_future))
+                print("==================== just append len(batch_queue)", len(batch_queue))
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
@@ -523,7 +529,9 @@ class EngineCore:
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
+            print(">>>>>>>>>>> model_output", type(model_output))
             if isinstance(model_output, VppContinuationOutput):
+                self.allow_over_batch_queue = True
                 if model_output.kv_connector_output:
                     self.scheduler._update_from_kv_xfer_finished(
                         model_output.kv_connector_output
@@ -531,35 +539,49 @@ class EngineCore:
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
-                batch_queue.appendleft((exec_future, scheduler_output, exec_future))
-                if (
-                    len(batch_queue) < self.batch_queue_size
-                    and not batch_queue[-1][0].done()
-                ):
-                    return None, True
+                if model_output.next_vp_stage == 1:
+                    # We aren't waiting for any tokens, get any grammar output
+                    # and sample immediately.
+                    grammar_output = self.scheduler.get_grammar_bitmask(
+                        scheduler_output
+                    )
+                    future = self.model_executor.sample_tokens(
+                        grammar_output, non_block=True
+                    )
+                else:
+                    future = cast(
+                        Future[ModelRunnerOutput | VppContinuationOutput | None],
+                        exec_future,
+                    )
+                batch_queue.appendleft((future, scheduler_output, exec_future))
                 return None, True
+
             if model_output is None:
-                if not scheduler_output.vpp_enabled:
-                    # None from sample_tokens() implies that the original execute_model()
-                    # call failed - raise that exception.
-                    exec_model_fut.result()
-                    raise RuntimeError("unexpected error")
-                if scheduler_output.pending_structured_output_tokens:
-                    self._deferred_scheduler_output = scheduler_output
-                    return None, True
-                grammar_output = self.scheduler.get_grammar_bitmask(
-                    scheduler_output
-                )
-                future = self.model_executor.sample_tokens(
-                    grammar_output, non_block=True
-                )
-                batch_queue.appendleft((future, scheduler_output, exec_model_fut))
-                if (
-                    len(batch_queue) < self.batch_queue_size
-                    and not batch_queue[-1][0].done()
-                ):
-                    return None, True
-                return None, True
+                # None from sample_tokens() implies that the original execute_model()
+                # call failed - raise that exception.
+                exec_model_fut.result()
+                raise RuntimeError("unexpected error")
+                # if not scheduler_output.vpp_enabled:
+                #     # None from sample_tokens() implies that the original execute_model()
+                #     # call failed - raise that exception.
+                #     exec_model_fut.result()
+                #     raise RuntimeError("unexpected error")
+                # if scheduler_output.pending_structured_output_tokens:
+                #     self._deferred_scheduler_output = scheduler_output
+                #     return None, True
+                # grammar_output = self.scheduler.get_grammar_bitmask(
+                #     scheduler_output
+                # )
+                # future = self.model_executor.sample_tokens(
+                #     grammar_output, non_block=True
+                # )
+                # batch_queue.appendleft((future, scheduler_output, exec_model_fut))
+                # if (
+                #     len(batch_queue) < self.batch_queue_size
+                #     and not batch_queue[-1][0].done()
+                # ):
+                #     return None, True
+                # return None, True
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
