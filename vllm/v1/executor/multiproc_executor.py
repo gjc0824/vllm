@@ -444,11 +444,12 @@ class MultiprocExecutor(Executor):
         # 16-23, PP rank 2
         # 24-31, PP rank 3
         # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)
-        return (
-            self.world_size
-            - self.parallel_config.tensor_parallel_size
-            * self.parallel_config.prefill_context_parallel_size
-        )
+        return 0
+        # return (
+        #     self.world_size
+        #     - self.parallel_config.tensor_parallel_size
+        #     * self.parallel_config.prefill_context_parallel_size
+        # )
 
 
 @dataclass

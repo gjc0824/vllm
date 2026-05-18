@@ -38,6 +38,7 @@ from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vll
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -327,6 +328,8 @@ class DeepseekV2MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        # if get_tp_group().rank_in_group == 0:
+        #     logger.info(f"before moe hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}")
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
@@ -346,6 +349,9 @@ class DeepseekV2MoE(nn.Module):
             fused_moe_out = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
+            # if get_tp_group().rank_in_group == 0:
+            #     logger.info(f"in moe shared_output.shape: {fused_moe_out[0].shape}, shared_output: {fused_moe_out[0]}")
+            #     logger.info(f"in moe final_hidden_states.shape: {fused_moe_out[1].shape}, final_hidden_states: {fused_moe_out[1]}")
 
         shared_output, final_hidden_states = fused_moe_out
         if self.shared_experts is None:
@@ -1017,7 +1023,11 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # if get_tp_group().rank_in_group == 0:
+        #     logger.info(f"before moe hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}, residual: {residual}")
         hidden_states = self.mlp(hidden_states)
+        # if get_tp_group().rank_in_group == 0:
+        #     logger.info(f"after moe hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}, residual: {residual}")
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow

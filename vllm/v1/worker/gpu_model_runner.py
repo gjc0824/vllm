@@ -2822,7 +2822,7 @@ class GPUModelRunner(
         else:
             positions = self.positions.gpu[:num_input_tokens]
 
-        if is_first_rank:
+        if is_first_rank or self._get_vpp_size() > 1:
             intermediate_tensors = None
         else:
             assert intermediate_tensors is not None
