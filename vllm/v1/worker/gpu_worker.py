@@ -151,6 +151,9 @@ class Worker(WorkerBase):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        self.enable_pp_async_send = (
+            not vllm_config.parallel_config.disable_pp_async_send
+        )
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
@@ -753,8 +756,10 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # ensure any previous non-blocking PP sends are complete
-        if self._pp_send_work:
+        # In the legacy path, finish the previous non-blocking PP send before
+        # starting a new step. Async PP send mode keeps those buffers in the
+        # PP group coordinator and lets later steps continue.
+        if self._pp_send_work and not self.enable_pp_async_send:
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
@@ -836,7 +841,10 @@ class Worker(WorkerBase):
             output.tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
+            async_metadata=self.enable_pp_async_send,
         )
+        if self.enable_pp_async_send:
+            self._pp_send_work = []
 
         return None
 

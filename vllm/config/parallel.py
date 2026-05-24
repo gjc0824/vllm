@@ -110,6 +110,8 @@ class ParallelConfig:
 
     pipeline_parallel_size: int = 1
     """Number of pipeline parallel groups."""
+    disable_pp_async_send: bool = False
+    """Disable async send buffering for pipeline parallel communication."""
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
     prefill_context_parallel_size: int = 1

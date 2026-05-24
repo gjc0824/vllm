@@ -440,6 +440,7 @@ class EngineArgs:
     ) = ParallelConfig.distributed_executor_backend
     # number of P/D disaggregation (or other disaggregation) workers
     pipeline_parallel_size: int = ParallelConfig.pipeline_parallel_size
+    disable_pp_async_send: bool = ParallelConfig.disable_pp_async_send
     master_addr: str = ParallelConfig.master_addr
     master_port: int = ParallelConfig.master_port
     nnodes: int = ParallelConfig.nnodes
@@ -905,6 +906,10 @@ class EngineArgs:
             "--pipeline-parallel-size",
             "-pp",
             **parallel_kwargs["pipeline_parallel_size"],
+        )
+        parallel_group.add_argument(
+            "--disable-pp-async-send",
+            **parallel_kwargs["disable_pp_async_send"],
         )
         parallel_group.add_argument("--master-addr", **parallel_kwargs["master_addr"])
         parallel_group.add_argument("--master-port", **parallel_kwargs["master_port"])
@@ -1857,6 +1862,7 @@ class EngineArgs:
 
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
+            disable_pp_async_send=self.disable_pp_async_send,
             tensor_parallel_size=self.tensor_parallel_size,
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,

@@ -27,7 +27,7 @@ import contextlib
 import gc
 import pickle
 import weakref
-from collections import namedtuple
+from collections import deque, namedtuple
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -399,6 +399,7 @@ class GroupCoordinator:
             and self.device_communicator
             and getattr(self.device_communicator, "supports_tensor_dict", False)
         )
+        self._async_send_buff: deque[tuple[Handle, torch.Tensor]] = deque()
 
     def create_mq_broadcaster(
         self, writer_rank=0, external_writer_handle=None, blocking=True
@@ -651,7 +652,20 @@ class GroupCoordinator:
         )
         return obj_list
 
-    def send_object(self, obj: Any, dst: int) -> None:
+    def _release_completed_send_buff(self) -> None:
+        while self._async_send_buff and self._async_send_buff[0][0].is_completed():
+            self._async_send_buff.popleft()
+
+    def _wait_send_buff(self) -> None:
+        while self._async_send_buff:
+            self._async_send_buff[0][0].wait()
+            self._async_send_buff.popleft()
+
+    def _track_async_send(self, handle: Handle, tensor: torch.Tensor) -> None:
+        self._release_completed_send_buff()
+        self._async_send_buff.append((handle, tensor))
+
+    def send_object(self, obj: Any, dst: int, is_async: bool = False) -> None:
         """Send the input object list to the destination rank."""
         """NOTE: `dst` is the local rank of the destination rank."""
 
@@ -669,12 +683,27 @@ class GroupCoordinator:
             [object_tensor.numel()], dtype=torch.long, device="cpu"
         )
 
-        # Send object size
-
-        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
-
-        # Send object
-        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        if is_async:
+            # The size tensor has the same shape for every object. Keep object
+            # messages ordered because this path does not use distinct tags.
+            self._wait_send_buff()
+            size_handle = torch.distributed.isend(
+                size_tensor, dst=self.ranks[dst], group=self.cpu_group
+            )
+            self._track_async_send(size_handle, size_tensor)
+            object_handle = torch.distributed.isend(
+                object_tensor, dst=self.ranks[dst], group=self.cpu_group
+            )
+            self._track_async_send(object_handle, object_tensor)
+        else:
+            # Send object size
+            torch.distributed.send(
+                size_tensor, dst=self.ranks[dst], group=self.cpu_group
+            )
+            # Send object
+            torch.distributed.send(
+                object_tensor, dst=self.ranks[dst], group=self.cpu_group
+            )
 
         return None
 
@@ -843,6 +872,7 @@ class GroupCoordinator:
             dst=dst,
             all_gather_group=all_gather_group,
             all_gather_tensors=all_gather_tensors,
+            async_metadata=False,
         )
         for handle in handles:
             handle.wait()
@@ -854,6 +884,7 @@ class GroupCoordinator:
         dst: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        async_metadata: bool = False,
     ) -> list[Handle]:
         if self.world_size <= 1:
             return []
@@ -880,7 +911,7 @@ class GroupCoordinator:
         metadata_group = self.cpu_group
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        self.send_object(metadata_list, dst=dst)
+        self.send_object(metadata_list, dst=dst, is_async=async_metadata)
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
@@ -901,6 +932,8 @@ class GroupCoordinator:
             )
             if tensor.is_cuda:
                 tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            if async_metadata:
+                self._track_async_send(handle, tensor)
             handles.append(handle)
 
         return handles
