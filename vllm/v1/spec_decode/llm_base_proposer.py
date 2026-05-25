@@ -1303,6 +1303,10 @@ class SpecDecodeBaseProposer:
         return model
 
     def load_model(self, target_model: nn.Module) -> None:
+        assert get_pp_group().is_last_rank, (
+            f"{self.method} drafter must be loaded on the last pipeline stage."
+        )
+
         target_attn_layer_names = set(
             get_layers_from_vllm_config(
                 self.vllm_config,

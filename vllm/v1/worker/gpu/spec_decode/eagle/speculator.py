@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -142,6 +143,10 @@ class EagleSpeculator:
         self.decode_cudagraph_manager.pool = self.prefill_cudagraph_manager.pool
 
     def load_model(self, target_model: nn.Module) -> None:
+        assert get_pp_group().is_last_rank, (
+            f"{self.method} speculator must be loaded on the last pipeline stage."
+        )
+
         target_attn_layer_names = get_layers_from_vllm_config(
             self.vllm_config,
             AttentionLayerBase,  # type: ignore[type-abstract]

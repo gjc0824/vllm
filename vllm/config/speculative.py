@@ -859,6 +859,26 @@ class SpeculativeConfig:
 
         return draft_parallel_config
 
+    def _get_draft_parallel_config_for_validation(self) -> ParallelConfig | None:
+        if self.draft_parallel_config is None:
+            return None
+
+        # Eagle-family drafters are instantiated locally on the last PP stage
+        # rather than partitioned across PP stages, so validate them as PP=1.
+        if (
+            self.method in ("eagle", "eagle3", "mtp")
+            and self.draft_parallel_config.pipeline_parallel_size > 1
+        ):
+            logger.warning(
+                "Validating %s drafter with pipeline_parallel_size=1 because "
+                "it is loaded locally on the last pipeline stage.",
+                self.method,
+            )
+            draft_parallel_config = copy.copy(self.draft_parallel_config)
+            draft_parallel_config.pipeline_parallel_size = 1
+            return draft_parallel_config
+
+        return self.draft_parallel_config
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
         if self.tensor_parallel_size is not None:
@@ -899,7 +919,7 @@ class SpeculativeConfig:
 
         if self.draft_model_config:
             self.draft_model_config.verify_with_parallel_config(
-                self.draft_parallel_config
+                self._get_draft_parallel_config_for_validation()
             )
 
         aux_hidden_states_supported = [
