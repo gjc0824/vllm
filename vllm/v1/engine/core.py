@@ -434,7 +434,14 @@ class EngineCore:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if not self.async_scheduling and self.use_spec_decode and model_executed:
+        # In batch_queue mode (PP), draft/spec tokens are consumed alongside the
+        # corresponding model output instead of as a global step-end side effect.
+        if (
+            self.batch_queue is None
+            and not self.async_scheduling
+            and self.use_spec_decode
+            and model_executed
+        ):
             # Take the draft token ids.
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
@@ -1211,7 +1218,7 @@ class EngineCoreProc(EngineCore):
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
         # Post-step hook.
-        #self.post_step(model_executed)
+        self.post_step(model_executed)
 
         # If no model execution happened but there are waiting requests
         # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow
