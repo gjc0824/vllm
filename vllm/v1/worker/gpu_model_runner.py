@@ -1284,6 +1284,14 @@ class GPUModelRunner(
                     # sampled token ids back because there's no direct communication
                     # between the first-stage worker and the last-stage worker.
                     new_token_ids = req_data.new_token_ids[i]
+                    if (
+                        req_index is not None
+                        and self.speculative_config
+                        and self.model_config.is_hybrid
+                    ):
+                        self.input_batch.num_accepted_tokens_cpu[req_index] = (
+                            len(new_token_ids) or 1
+                        )
                     # Add the sampled token(s) from the previous step (if any).
                     # This doesn't include "unverified" tokens like spec tokens.
                     num_new_tokens = (
@@ -1389,6 +1397,10 @@ class GPUModelRunner(
                 end = start + len(new_toks)
                 self.input_batch.token_ids_cpu[req_index, start:end] = new_toks
                 self.input_batch.num_tokens_no_spec[req_index] = end
+                if self.speculative_config and self.model_config.is_hybrid:
+                    self.input_batch.num_accepted_tokens_cpu[req_index] = (
+                        len(new_toks) or 1
+                    )
 
             # Place spec tokens at the (now-correct) num_tokens_no_spec offset.
             self.input_batch.update_req_spec_token_ids(
