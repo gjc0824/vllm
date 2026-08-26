@@ -59,6 +59,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
+from vllm.v1.core.layered_prefill import LayeredForwardOutput
 
 from .interfaces import (
     EagleModelMixin,
@@ -431,6 +432,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 @support_torch_compile
 class Qwen3MoeModel(nn.Module, EagleModelMixin):
+    supports_layered_prefill = True
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             # weight_name: (param_name, shard_id)
@@ -481,6 +484,57 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def forward_layered_prefill(
+        self,
+        *,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        layer_start: int,
+        layer_end: int,
+        frontier: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> LayeredForwardOutput:
+        """Run a contiguous layer group for a PP=1 Qwen3-MoE prompt view."""
+        if self.start_layer != 0 or self.end_layer != len(self.layers):
+            raise RuntimeError("Qwen3 layered prefill currently requires PP=1")
+        if not 0 <= layer_start < layer_end <= self.end_layer:
+            raise ValueError(
+                f"invalid layered layer range [{layer_start}, {layer_end})"
+            )
+        if frontier is not None and (
+            input_ids is not None or inputs_embeds is not None
+        ):
+            raise ValueError(
+                "frontier and initial input embeddings are mutually exclusive"
+            )
+        if frontier is None:
+            if intermediate_tensors is not None:
+                raise ValueError("PP intermediate tensors are not supported for PP=1")
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                if input_ids is None:
+                    raise ValueError(
+                        "layered group 0 requires input_ids or inputs_embeds"
+                    )
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+        else:
+            hidden_states, residual = frontier
+
+        for global_idx in range(layer_start, layer_end):
+            layer = self.layers[global_idx]
+            if isinstance(layer, PPMissingLayer):
+                raise RuntimeError("layered prefill encountered a missing PP layer")
+            hidden_states, residual = layer(positions, hidden_states, residual)
+
+        is_final_layer = layer_end == self.end_layer
+        if is_final_layer:
+            hidden_states, _ = self.norm(hidden_states, residual)
+            residual = None
+        return LayeredForwardOutput(hidden_states, residual, is_final_layer)
 
     def forward(
         self,
@@ -632,6 +686,29 @@ class Qwen3MoeForCausalLM(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    supports_layered_prefill = True
+
+    def forward_layered_prefill(
+        self,
+        *,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        layer_start: int,
+        layer_end: int,
+        frontier: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> LayeredForwardOutput:
+        return self.model.forward_layered_prefill(
+            input_ids=input_ids,
+            positions=positions,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            frontier=frontier,
+            inputs_embeds=inputs_embeds,
+            intermediate_tensors=intermediate_tensors,
+        )
 
     def forward(
         self,

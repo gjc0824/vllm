@@ -173,6 +173,16 @@ class Request:
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
+        # Layered prefill progress is deliberately separate from token
+        # progress.  These fields are CPU-only scheduler metadata; activation
+        # frontiers live in the worker process.
+        self.layered_prefill_enabled = False
+        self.layered_prefill_cohort_id = -1
+        self.layered_prefill_group_id = 0
+        self.layered_prefill_num_groups = 0
+        self.layered_prefill_query_tokens = 0
+        self.layered_prefill_kv_reserved = False
+
         # Multi-modal related
         self.mm_features = mm_features or []
 

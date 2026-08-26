@@ -19,11 +19,13 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+    from vllm.v1.core.layered_prefill import LayeredPrefillPlan
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
     KVCacheBlockCopy = object
+    LayeredPrefillPlan = object
     LoRARequest = object
     MultiModalFeatureSpec = object
     PoolingParams = object
@@ -257,6 +259,10 @@ class SchedulerOutput:
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+
+    # Optional layer-group execution plan. ``None`` preserves the regular
+    # token-progress scheduler and is the default for every model.
+    layered_prefill_plan: "LayeredPrefillPlan | None" = None
 
     # Producer partial-tail offload hand-off for external KV connectors:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at

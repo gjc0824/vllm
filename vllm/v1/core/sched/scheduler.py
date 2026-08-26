@@ -38,6 +38,10 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.layered_prefill import (
+    LayeredPrefillPolicy,
+    reset_layered_prefill_request,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -80,6 +84,8 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
+        self.layered_prefill_policy = LayeredPrefillPolicy(vllm_config)
+        self._hold_layered_prefills = False
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
@@ -437,6 +443,344 @@ class Scheduler(SchedulerInterface):
         return max(end - start, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        """Schedule one step, optionally using the layered-prefill policy."""
+        if self.layered_prefill_policy.enabled:
+            return self._schedule_layered_prefill(throttle_prefills)
+        return self._schedule_regular(throttle_prefills)
+
+    def _schedule_layered_prefill(
+        self, throttle_prefills: bool = False
+    ) -> SchedulerOutput:
+        """Run the Phase 1 one-cohort policy around the regular scheduler.
+
+        The regular scheduler remains the source of truth for Decode admission,
+        preemption and all connector-free bookkeeping.  We reserve one prompt
+        cohort's token budget, let the regular path schedule Decode rows, then
+        append the layer-group query rows with an explicit commit mask.
+        """
+        candidate = self._get_layered_prefill_candidate()
+        if candidate is None:
+            return self._schedule_regular(throttle_prefills)
+
+        if self._pause_state != PauseState.UNPAUSED:
+            self._reset_or_preempt_layered_request(candidate)
+            return self._schedule_regular(throttle_prefills)
+
+        if not self._layered_prefill_supported_for_scheduler():
+            # Fail closed: an unsupported configuration must not leave a
+            # request marked layered while the regular scheduler skips it.
+            self._reset_or_preempt_layered_request(candidate)
+            return self._schedule_regular(throttle_prefills)
+
+        query_tokens = candidate.layered_prefill_query_tokens
+        if query_tokens <= 0 or query_tokens >= self.max_num_scheduled_tokens:
+            logger.warning_once(
+                "Layered prefill request %s cannot leave token budget for a "
+                "Decode query; falling back to regular scheduling.",
+                candidate.request_id,
+            )
+            self._reset_or_preempt_layered_request(candidate)
+            return self._schedule_regular(throttle_prefills)
+
+        # Layered prefill is intended to hide P work behind Decode.  Starting
+        # a fresh cohort with no Decode work would only add scheduler steps to
+        # TTFT, so let the ordinary full-prefill path handle that case.  Once
+        # a cohort has advanced past group 0, it must finish from its saved
+        # frontier even if Decode drains in the meantime.
+        if (
+            candidate.layered_prefill_group_id == 0
+            and not self._has_layered_decode_work(candidate)
+        ):
+            self._reset_or_preempt_layered_request(candidate)
+            return self._schedule_regular(throttle_prefills)
+
+        admission_status = candidate.status
+        request_needs_admission = admission_status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        )
+        request_is_new = admission_status == RequestStatus.WAITING
+        if request_needs_admission:
+            # Keep the candidate out of the regular waiting traversal while it
+            # admits Decode requests.  It is requeued if the reservation fails.
+            self._remove_layered_candidate_from_waiting(candidate)
+
+        old_max_tokens = self.max_num_scheduled_tokens
+        self.max_num_scheduled_tokens = old_max_tokens - query_tokens
+        self._hold_layered_prefills = True
+        try:
+            scheduler_output = self._schedule_regular(throttle_prefills)
+        finally:
+            self._hold_layered_prefills = False
+            self.max_num_scheduled_tokens = old_max_tokens
+
+        if not request_needs_admission and (
+            not candidate.layered_prefill_enabled
+            or candidate.status != RequestStatus.RUNNING
+        ):
+            # The regular admission path may have preempted this request to
+            # make room for a higher-priority Decode request.  Its preemption
+            # handler already reset the frontier metadata and requeued it.
+            return scheduler_output
+
+        # A running request already owns its prompt blocks.  A newly admitted
+        # request is removed from the waiting queue and reserves them exactly
+        # once; every later group reuses the reservation.
+        if request_needs_admission:
+            if len(self.running) >= self.max_num_running_reqs:
+                self._requeue_layered_candidate(candidate, admission_status)
+                return scheduler_output
+            new_blocks = self.kv_cache_manager.allocate_slots(
+                candidate,
+                query_tokens,
+                num_lookahead_tokens=0,
+                delay_cache_blocks=True,
+                has_scheduled_reqs=bool(self.running),
+            )
+            if new_blocks is None:
+                if candidate.layered_prefill_group_id == 0:
+                    reset_layered_prefill_request(candidate)
+                self._requeue_layered_candidate(candidate, admission_status)
+                return scheduler_output
+            candidate.status = RequestStatus.RUNNING
+            self.running.append(candidate)
+            self._inflight_prefills.add(candidate)
+            layered_zero_ids = self._get_new_block_ids_to_zero()
+            if layered_zero_ids:
+                existing_zero_ids = scheduler_output.new_block_ids_to_zero or []
+                scheduler_output.new_block_ids_to_zero = (
+                    existing_zero_ids + layered_zero_ids
+                )
+            if request_is_new:
+                scheduler_output.scheduled_new_reqs.append(
+                    NewRequestData.from_request(
+                        candidate, new_blocks.get_block_ids()
+                    )
+                )
+            else:
+                cached = self._make_cached_request_data(
+                    [],
+                    [candidate],
+                    {candidate.request_id: query_tokens},
+                    {},
+                    {candidate.request_id: new_blocks},
+                )
+                self._append_cached_request_data(
+                    scheduler_output.scheduled_cached_reqs, cached
+                )
+        elif not candidate.layered_prefill_kv_reserved:
+            # This branch is only reachable for a request restored by an
+            # external scheduler implementation.  Preserve the same invariant
+            # rather than silently appending duplicate blocks.
+            raise RuntimeError(
+                f"Layered request {candidate.request_id} has no KV reservation"
+            )
+
+        req_id = candidate.request_id
+        scheduler_output.num_scheduled_tokens[req_id] = query_tokens
+        scheduler_output.total_num_scheduled_tokens += query_tokens
+
+        if not request_needs_admission:
+            cached = self._make_cached_request_data(
+                [candidate],
+                [],
+                {req_id: query_tokens},
+                {},
+                {req_id: self.kv_cache_manager.empty_kv_cache_blocks},
+            )
+            self._append_cached_request_data(
+                scheduler_output.scheduled_cached_reqs, cached
+            )
+
+        # The worker must replay the prompt positions [0, query_tokens) for
+        # every layer group.  Keep the scheduler's logical token count (which
+        # is committed only by the final group) separate from the worker input
+        # cursor, otherwise the final group would start at position q and
+        # either read output-token slots or write duplicate KV entries.
+        if not request_is_new:
+            cached_req_ids = scheduler_output.scheduled_cached_reqs.req_ids
+            cached_index = cached_req_ids.index(req_id)
+            scheduler_output.scheduled_cached_reqs.num_computed_tokens[
+                cached_index
+            ] = 0
+
+        plan = self.layered_prefill_policy.make_plan(candidate)
+        scheduler_output.layered_prefill_plan = plan
+        candidate.layered_prefill_kv_reserved = True
+        self._update_after_layered_schedule(candidate, scheduler_output)
+        self.prev_step_scheduled_req_ids.add(req_id)
+        return scheduler_output
+
+    def _remove_layered_candidate_from_waiting(self, request: Request) -> None:
+        for queue in (self.waiting, self.skipped_waiting):
+            if any(item is request for item in queue):
+                queue.remove_request(request)
+                return
+        raise RuntimeError(
+            f"Layered request {request.request_id} is not in a waiting queue"
+        )
+
+    def _requeue_layered_candidate(
+        self, request: Request, status: RequestStatus
+    ) -> None:
+        request.status = status
+        self.waiting.prepend_request(request)
+
+    def _reset_or_preempt_layered_request(self, request: Request) -> None:
+        """Drop partial layered state before falling back to token scheduling."""
+        if request.status == RequestStatus.RUNNING:
+            self.running.remove(request)
+            self._preempt_request(request, time.monotonic())
+        else:
+            reset_layered_prefill_request(request)
+
+    def _get_layered_prefill_candidate(self) -> Request | None:
+        for request in self.running:
+            if (
+                self._is_layered_prefill_pending(request)
+                and self._is_layered_request_eligible(request)
+            ):
+                return request
+        # Decode requests and unsupported request types can be ahead of a
+        # prompt in either FCFS or priority queues.  Walk the queue rather
+        # than looking only at its head so a Decode row can share the step
+        # with the first eligible P cohort.
+        for queue in (self.waiting, self.skipped_waiting):
+            for request in queue:
+                if not self._is_layered_request_eligible(request):
+                    continue
+                if not request.layered_prefill_enabled:
+                    self.layered_prefill_policy.initialize_request(request)
+                if self._is_layered_prefill_pending(request):
+                    return request
+        return None
+
+    def _should_hold_for_layered_prefill(self, request: Request) -> bool:
+        """Whether regular scheduling must leave a prompt for the policy."""
+        return bool(
+            self._hold_layered_prefills
+            and request.status
+            in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            and request.pooling_params is None
+            and request.num_prompt_tokens > 0
+            and request.num_computed_tokens == 0
+            and not request.output_token_ids
+        )
+
+    def _has_layered_decode_work(self, candidate: Request) -> bool:
+        """Return whether another request can provide the D half of a step."""
+        queues = (self.running, self.waiting, self.skipped_waiting)
+        for queue in queues:
+            for request in queue:
+                if request is candidate:
+                    continue
+                if self._is_layered_decode_request(request):
+                    return True
+        return False
+
+    @staticmethod
+    def _is_layered_decode_request(request: Request) -> bool:
+        # A partially scheduled prompt also has computed tokens, but it is
+        # still P work.  A request at (or beyond) its prompt boundary has a
+        # decode query pending even before its first sampled token exists.
+        return bool(
+            request.output_token_ids
+            or (
+                request.num_prompt_tokens > 0
+                and (
+                    request.num_computed_tokens > request.num_prompt_tokens
+                    or (
+                        request.num_computed_tokens == request.num_prompt_tokens
+                        and request.num_in_flight_tokens == 0
+                    )
+                )
+            )
+        )
+
+    @staticmethod
+    def _is_layered_request_eligible(request: Request) -> bool:
+        sampling_params = request.sampling_params
+        return bool(
+            request.status
+            in (RequestStatus.WAITING, RequestStatus.PREEMPTED, RequestStatus.RUNNING)
+            and request.pooling_params is None
+            and request.num_prompt_tokens > 0
+            and request.num_computed_tokens == 0
+            and not request.output_token_ids
+            and sampling_params is not None
+            and sampling_params.logprobs is None
+            and sampling_params.prompt_logprobs is None
+            and not sampling_params.logprob_token_ids
+            and not request.use_structured_output
+        )
+
+    @staticmethod
+    def _is_layered_prefill_pending(request: Request) -> bool:
+        return bool(
+            request.layered_prefill_enabled
+            and request.layered_prefill_group_id
+            < request.layered_prefill_num_groups
+        )
+
+    def _layered_prefill_supported_for_scheduler(self) -> bool:
+        # Phase 1 is intentionally connector-free, prefix-cache-free and
+        # synchronous.  TP ranks consume the same SchedulerOutput through the
+        # normal worker broadcast, so TP does not need a scheduler-side gate;
+        # DP=1 is enforced by the Ascend platform until plan synchronization
+        # across DP/EP ranks is implemented.  Model capability is checked by
+        # the worker.
+        parallel_config = self.parallel_config
+        cache_config = self.cache_config
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        layered_config = self.layered_prefill_policy.config
+        return bool(
+            parallel_config.pipeline_parallel_size == 1
+            and not self.scheduler_config.async_scheduling
+            and not getattr(parallel_config, "enable_dbo", False)
+            and (
+                not layered_config.require_eager
+                or getattr(self.vllm_config.model_config, "enforce_eager", False)
+            )
+            and self.connector is None
+            and not getattr(cache_config, "enable_prefix_caching", False)
+            and kv_transfer_config is None
+        )
+
+    @staticmethod
+    def _append_cached_request_data(
+        target: CachedRequestData, source: CachedRequestData
+    ) -> None:
+        target.req_ids.extend(source.req_ids)
+        target.resumed_req_ids.update(source.resumed_req_ids)
+        target.new_token_ids.extend(source.new_token_ids)
+        target.all_token_ids.update(source.all_token_ids)
+        target.new_block_ids.extend(source.new_block_ids)
+        target.num_computed_tokens.extend(source.num_computed_tokens)
+        target.num_output_tokens.extend(source.num_output_tokens)
+
+    def _update_after_layered_schedule(
+        self, request: Request, scheduler_output: SchedulerOutput
+    ) -> None:
+        req_id = request.request_id
+        plan = scheduler_output.layered_prefill_plan
+        assert plan is not None
+        query_tokens = plan.query_tokens[req_id]
+        commit_tokens = plan.commit_tokens[req_id]
+        request.num_in_flight_tokens += query_tokens
+        request.num_computed_tokens += commit_tokens
+        request.is_prefill_chunk = commit_tokens == 0
+        if request.is_prefill_chunk:
+            self._inflight_prefills.add(request)
+        else:
+            self._inflight_prefills.discard(request)
+            scheduler_output.has_structured_output_requests |= (
+                request.use_structured_output
+            )
+        request.layered_prefill_group_id += 1
+        if not request.is_prefill_chunk:
+            reset_layered_prefill_request(request)
+
+    def _schedule_regular(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -484,6 +828,20 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            # Layered prefill is appended by ``_schedule_layered_prefill``
+            # after Decode rows have been admitted.  Keeping it out of this
+            # token scheduler prevents accidental token-progress commits.
+            if self._is_layered_prefill_pending(request):
+                if self._is_layered_request_eligible(request):
+                    req_index += 1
+                    continue
+                # A streaming update or other request mutation can make a
+                # partially initialized request ineligible.  Release its
+                # reservation before handing it back to regular scheduling.
+                self.running.pop(req_index)
+                self._preempt_request(request, time.monotonic())
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -696,6 +1054,18 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                layered_pending = self._is_layered_prefill_pending(request)
+                if layered_pending and not self._is_layered_request_eligible(request):
+                    reset_layered_prefill_request(request)
+                    layered_pending = False
+                if (
+                    layered_pending
+                    and self._is_layered_request_eligible(request)
+                ) or self._should_hold_for_layered_prefill(request):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -1290,6 +1660,8 @@ class Scheduler(SchedulerInterface):
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
+        if request.layered_prefill_enabled:
+            reset_layered_prefill_request(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if request.spec_token_ids:
@@ -1372,6 +1744,12 @@ class Scheduler(SchedulerInterface):
 
         Discards the last sampled output token from the prior input chunk.
         """
+
+        # A streaming session changes the prompt boundary and invalidates any
+        # saved partial layer frontier.  The next session chunk must enter as a
+        # fresh ordinary/layered group-0 request.
+        if session.layered_prefill_enabled:
+            reset_layered_prefill_request(session)
 
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
@@ -2303,6 +2681,8 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        if request.layered_prefill_enabled:
+            reset_layered_prefill_request(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing

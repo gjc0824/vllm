@@ -4173,6 +4173,11 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if scheduler_output.layered_prefill_plan is not None:
+            raise RuntimeError(
+                "Layered prefill requires a model runner with explicit "
+                "layered-prefill support"
+            )
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
