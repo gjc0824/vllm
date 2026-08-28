@@ -25,6 +25,7 @@
 
 from collections.abc import Iterable
 from itertools import islice
+import os
 from typing import Any
 
 import torch
@@ -524,11 +525,33 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
         else:
             hidden_states, residual = frontier
 
+        trace_layered = os.environ.get("VLLM_LAYERED_PREFILL_TRACE") == "1"
+        if trace_layered:
+            logger.info(
+                "Layered trace enter range=[%d,%d) tokens=%d frontier=%s "
+                "input_sum=%.6e position_sum=%.6e",
+                layer_start,
+                layer_end,
+                hidden_states.shape[0],
+                frontier is not None,
+                hidden_states.float().sum().item(),
+                positions.float().sum().item(),
+            )
+
         for global_idx in range(layer_start, layer_end):
             layer = self.layers[global_idx]
             if isinstance(layer, PPMissingLayer):
                 raise RuntimeError("layered prefill encountered a missing PP layer")
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if trace_layered:
+                logger.info(
+                    "Layered trace layer=%d hidden_sum=%.6e residual_sum=%s",
+                    global_idx,
+                    hidden_states.float().sum().item(),
+                    "none"
+                    if residual is None
+                    else f"{residual.float().sum().item():.6e}",
+                )
 
         is_final_layer = layer_end == self.end_layer
         if is_final_layer:

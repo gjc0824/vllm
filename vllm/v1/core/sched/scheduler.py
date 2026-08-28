@@ -488,7 +488,8 @@ class Scheduler(SchedulerInterface):
         # a cohort has advanced past group 0, it must finish from its saved
         # frontier even if Decode drains in the meantime.
         if (
-            candidate.layered_prefill_group_id == 0
+            self.layered_prefill_policy.config.require_pd_mixed
+            and candidate.layered_prefill_group_id == 0
             and not self._has_layered_decode_work(candidate)
         ):
             self._reset_or_preempt_layered_request(candidate)
