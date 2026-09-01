@@ -12,6 +12,7 @@ from vllm.v1.core.layered_prefill import (
     LayeredPrefillPolicy,
     LayeredPrefillStateStore,
     make_layer_group_ranges,
+    make_pp_aligned_layer_group_ranges,
     select_num_groups,
 )
 
@@ -41,6 +42,29 @@ def test_layer_group_ranges_cover_each_layer_once():
     ]
     assert ranges[-1].end == 10
     assert sum(item.end - item.start for item in ranges) == 10
+
+
+def test_pp_layer_group_ranges_do_not_cross_stage_boundaries():
+    ranges = make_pp_aligned_layer_group_ranges(8, 4, 2)
+
+    assert [(item.start, item.end) for item in ranges] == [
+        (0, 2),
+        (2, 4),
+        (4, 6),
+        (6, 8),
+    ]
+
+
+def test_pp_layer_group_ranges_follow_custom_partition(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "2,6")
+    ranges = make_pp_aligned_layer_group_ranges(8, 4, 2)
+
+    assert [(item.start, item.end) for item in ranges] == [
+        (0, 1),
+        (1, 2),
+        (2, 5),
+        (5, 8),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -124,6 +148,27 @@ def test_policy_initializes_request_and_advances_groups():
     assert second.group_id == 1
     assert second.commit_tokens["req"] == 513
     assert second.reuse_kv_blocks is True
+
+
+def test_policy_aligns_pp_groups_with_stage_partitions():
+    config = _config(layers=8)
+    config.parallel_config = SimpleNamespace(pipeline_parallel_size=2)
+    policy = LayeredPrefillPolicy(config)
+    request = SimpleNamespace(
+        request_id="req",
+        num_prompt_tokens=1,
+        layered_prefill_enabled=False,
+        layered_prefill_group_id=0,
+        layered_prefill_num_groups=0,
+        layered_prefill_query_tokens=0,
+        layered_prefill_cohort_id=-1,
+        layered_prefill_kv_reserved=False,
+    )
+
+    policy.initialize_request(request)
+    assert request.layered_prefill_num_groups == 2
+    plan = policy.make_plan(request)
+    assert (plan.group_start, plan.group_end) == (0, 4)
 
 
 def test_frontier_store_is_keyed_by_request_id():

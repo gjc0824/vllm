@@ -497,31 +497,34 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> LayeredForwardOutput:
-        """Run a contiguous layer group for a PP=1 Qwen3-MoE prompt view."""
-        if self.start_layer != 0 or self.end_layer != len(self.layers):
-            raise RuntimeError("Qwen3 layered prefill currently requires PP=1")
-        if not 0 <= layer_start < layer_end <= self.end_layer:
+        """Run the local portion of a contiguous global layer group."""
+        num_hidden_layers = self.config.num_hidden_layers
+        if not 0 <= layer_start < layer_end <= num_hidden_layers:
             raise ValueError(
                 f"invalid layered layer range [{layer_start}, {layer_end})"
             )
         if frontier is not None and (
-            input_ids is not None or inputs_embeds is not None
+            input_ids is not None
+            or inputs_embeds is not None
+            or intermediate_tensors is not None
         ):
             raise ValueError(
-                "frontier and initial input embeddings are mutually exclusive"
+                "frontier and initial inputs are mutually exclusive"
             )
         if frontier is None:
             if intermediate_tensors is not None:
-                raise ValueError("PP intermediate tensors are not supported for PP=1")
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
+                hidden_states = intermediate_tensors["hidden_states"]
+                residual = intermediate_tensors.tensors.get("residual")
             else:
-                if input_ids is None:
-                    raise ValueError(
-                        "layered group 0 requires input_ids or inputs_embeds"
-                    )
-                hidden_states = self.embed_input_ids(input_ids)
-            residual = None
+                if inputs_embeds is not None:
+                    hidden_states = inputs_embeds
+                else:
+                    if input_ids is None:
+                        raise ValueError(
+                            "layered group 0 requires input_ids or inputs_embeds"
+                        )
+                    hidden_states = self.embed_input_ids(input_ids)
+                residual = None
         else:
             hidden_states, residual = frontier
 
@@ -538,10 +541,12 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
                 positions.float().sum().item(),
             )
 
-        for global_idx in range(layer_start, layer_end):
+        local_start = max(layer_start, self.start_layer)
+        local_end = min(layer_end, self.end_layer)
+        for global_idx in range(local_start, local_end):
             layer = self.layers[global_idx]
             if isinstance(layer, PPMissingLayer):
-                raise RuntimeError("layered prefill encountered a missing PP layer")
+                continue
             hidden_states, residual = layer(positions, hidden_states, residual)
             if trace_layered:
                 logger.info(
@@ -553,8 +558,8 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
                     else f"{residual.float().sum().item():.6e}",
                 )
 
-        is_final_layer = layer_end == self.end_layer
-        if is_final_layer:
+        is_final_layer = layer_end == num_hidden_layers
+        if is_final_layer and self.end_layer == num_hidden_layers:
             hidden_states, _ = self.norm(hidden_states, residual)
             residual = None
         return LayeredForwardOutput(hidden_states, residual, is_final_layer)

@@ -39,7 +39,7 @@ class LayerGroupRange:
 
 @dataclass(frozen=True)
 class LayeredPrefillConfig:
-    """Configuration for the Phase 1 PP=1 reference path.
+    """Configuration for the eager layered-prefill reference path.
 
     This is deliberately independent of Ascend configuration classes.  The
     same metadata is useful to upstream workers and the Ascend plugin, while
@@ -154,6 +154,78 @@ def make_layer_group_ranges(
         ranges.append(LayerGroupRange(group_id, start, end))
         start = end
     assert start == num_hidden_layers
+    return tuple(ranges)
+
+
+def make_pp_aligned_layer_group_ranges(
+    num_hidden_layers: int, num_groups: int, pipeline_parallel_size: int
+) -> tuple[LayerGroupRange, ...]:
+    """Partition layers into groups that never cross a PP stage boundary.
+
+    Layered Prefill keeps a prompt frontier on the stage that owns the active
+    group.  Keeping group ranges inside the static PP partition makes that
+    owner deterministic and avoids a reverse pipeline transfer.  Extra groups
+    are distributed over stages in order, while every stage receives at least
+    one group.
+    """
+
+    if pipeline_parallel_size <= 0:
+        raise ValueError("pipeline_parallel_size must be > 0")
+    if num_groups <= 0:
+        raise ValueError("num_groups must be > 0")
+    if pipeline_parallel_size == 1:
+        return make_layer_group_ranges(num_hidden_layers, num_groups)
+    if pipeline_parallel_size > num_hidden_layers:
+        raise ValueError(
+            "pipeline_parallel_size cannot exceed num_hidden_layers for "
+            "layered prefill"
+        )
+    if num_groups < pipeline_parallel_size:
+        num_groups = pipeline_parallel_size
+    if num_groups > num_hidden_layers:
+        num_groups = num_hidden_layers
+
+    from vllm.distributed.utils import get_pp_indices
+
+    stage_ranges = [
+        get_pp_indices(num_hidden_layers, stage, pipeline_parallel_size)
+        for stage in range(pipeline_parallel_size)
+    ]
+    stage_lengths = [end - start for start, end in stage_ranges]
+    if any(stage_length <= 0 for stage_length in stage_lengths):
+        raise ValueError(
+            "layered prefill requires every PP stage to own at least one layer"
+        )
+    groups_per_stage = [1] * pipeline_parallel_size
+    next_stage = 0
+    for _ in range(num_groups - pipeline_parallel_size):
+        for _ in range(pipeline_parallel_size):
+            if groups_per_stage[next_stage] < stage_lengths[next_stage]:
+                groups_per_stage[next_stage] += 1
+                next_stage = (next_stage + 1) % pipeline_parallel_size
+                break
+            next_stage = (next_stage + 1) % pipeline_parallel_size
+        else:
+            raise ValueError("cannot fit layered groups into PP stage partitions")
+
+    ranges: list[LayerGroupRange] = []
+    group_id = 0
+    for (stage_start, stage_end), stage_groups in zip(
+        stage_ranges, groups_per_stage
+    ):
+        stage_ranges_for_groups = make_layer_group_ranges(
+            stage_end - stage_start, stage_groups
+        )
+        for local_range in stage_ranges_for_groups:
+            ranges.append(
+                LayerGroupRange(
+                    group_id,
+                    stage_start + local_range.start,
+                    stage_start + local_range.end,
+                )
+            )
+            group_id += 1
+    assert len(ranges) == num_groups
     return tuple(ranges)
 
 
@@ -313,6 +385,10 @@ class LayeredPrefillPolicy:
         self.num_hidden_layers = (
             get_num_hidden_layers(vllm_config) if self.config.enabled else 0
         )
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        self.pipeline_parallel_size = int(
+            getattr(parallel_config, "pipeline_parallel_size", 1)
+        )
         self._next_cohort_id = 0
 
     @property
@@ -332,12 +408,21 @@ class LayeredPrefillPolicy:
         request.layered_prefill_enabled = True
         request.layered_prefill_cohort_id = self.new_cohort_id()
         request.layered_prefill_group_id = 0
-        request.layered_prefill_num_groups = select_num_groups(
+        num_groups = select_num_groups(
             request.num_prompt_tokens,
             self.num_hidden_layers,
             group_token_target=self.config.group_token_target,
             allowed_num_groups=self.config.allowed_num_groups,
         )
+        if self.pipeline_parallel_size > 1:
+            # A group must have one unambiguous PP owner.  Prefer the
+            # configured layout, but never allow fewer groups than stages.
+            request.layered_prefill_num_groups = min(
+                self.num_hidden_layers,
+                max(self.pipeline_parallel_size, num_groups),
+            )
+        else:
+            request.layered_prefill_num_groups = num_groups
         request.layered_prefill_query_tokens = request.num_prompt_tokens
         request.layered_prefill_kv_reserved = False
 
@@ -346,7 +431,11 @@ class LayeredPrefillPolicy:
             raise ValueError("request is not enabled for layered prefill")
         num_groups = request.layered_prefill_num_groups
         group_id = request.layered_prefill_group_id
-        ranges = make_layer_group_ranges(self.num_hidden_layers, num_groups)
+        ranges = make_pp_aligned_layer_group_ranges(
+            self.num_hidden_layers,
+            num_groups,
+            self.pipeline_parallel_size,
+        )
         layer_range = ranges[group_id]
         query_tokens = request.layered_prefill_query_tokens
         return LayeredPrefillPlan(

@@ -735,7 +735,7 @@ class Scheduler(SchedulerInterface):
         kv_transfer_config = self.vllm_config.kv_transfer_config
         layered_config = self.layered_prefill_policy.config
         return bool(
-            parallel_config.pipeline_parallel_size == 1
+            parallel_config.pipeline_parallel_size >= 1
             and not self.scheduler_config.async_scheduling
             and not getattr(parallel_config, "enable_dbo", False)
             and (
