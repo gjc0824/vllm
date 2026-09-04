@@ -25,7 +25,6 @@
 
 from collections.abc import Iterable
 from itertools import islice
-import os
 from typing import Any
 
 import torch
@@ -40,7 +39,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
@@ -60,7 +58,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
-from vllm.v1.core.layered_prefill import LayeredForwardOutput
 
 from .interfaces import (
     EagleModelMixin,
@@ -80,9 +77,6 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
-
-logger = init_logger(__name__)
-
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
@@ -433,8 +427,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 @support_torch_compile
 class Qwen3MoeModel(nn.Module, EagleModelMixin):
-    supports_layered_prefill = True
-
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             # weight_name: (param_name, shard_id)
@@ -485,84 +477,6 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
-
-    def forward_layered_prefill(
-        self,
-        *,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        layer_start: int,
-        layer_end: int,
-        frontier: tuple[torch.Tensor, torch.Tensor | None] | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
-    ) -> LayeredForwardOutput:
-        """Run the local portion of a contiguous global layer group."""
-        num_hidden_layers = self.config.num_hidden_layers
-        if not 0 <= layer_start < layer_end <= num_hidden_layers:
-            raise ValueError(
-                f"invalid layered layer range [{layer_start}, {layer_end})"
-            )
-        if frontier is not None and (
-            input_ids is not None
-            or inputs_embeds is not None
-            or intermediate_tensors is not None
-        ):
-            raise ValueError(
-                "frontier and initial inputs are mutually exclusive"
-            )
-        if frontier is None:
-            if intermediate_tensors is not None:
-                hidden_states = intermediate_tensors["hidden_states"]
-                residual = intermediate_tensors.tensors.get("residual")
-            else:
-                if inputs_embeds is not None:
-                    hidden_states = inputs_embeds
-                else:
-                    if input_ids is None:
-                        raise ValueError(
-                            "layered group 0 requires input_ids or inputs_embeds"
-                        )
-                    hidden_states = self.embed_input_ids(input_ids)
-                residual = None
-        else:
-            hidden_states, residual = frontier
-
-        trace_layered = os.environ.get("VLLM_LAYERED_PREFILL_TRACE") == "1"
-        if trace_layered:
-            logger.info(
-                "Layered trace enter range=[%d,%d) tokens=%d frontier=%s "
-                "input_sum=%.6e position_sum=%.6e",
-                layer_start,
-                layer_end,
-                hidden_states.shape[0],
-                frontier is not None,
-                hidden_states.float().sum().item(),
-                positions.float().sum().item(),
-            )
-
-        local_start = max(layer_start, self.start_layer)
-        local_end = min(layer_end, self.end_layer)
-        for global_idx in range(local_start, local_end):
-            layer = self.layers[global_idx]
-            if isinstance(layer, PPMissingLayer):
-                continue
-            hidden_states, residual = layer(positions, hidden_states, residual)
-            if trace_layered:
-                logger.info(
-                    "Layered trace layer=%d hidden_sum=%.6e residual_sum=%s",
-                    global_idx,
-                    hidden_states.float().sum().item(),
-                    "none"
-                    if residual is None
-                    else f"{residual.float().sum().item():.6e}",
-                )
-
-        is_final_layer = layer_end == num_hidden_layers
-        if is_final_layer and self.end_layer == num_hidden_layers:
-            hidden_states, _ = self.norm(hidden_states, residual)
-            residual = None
-        return LayeredForwardOutput(hidden_states, residual, is_final_layer)
 
     def forward(
         self,
@@ -714,29 +628,6 @@ class Qwen3MoeForCausalLM(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
-
-    supports_layered_prefill = True
-
-    def forward_layered_prefill(
-        self,
-        *,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        layer_start: int,
-        layer_end: int,
-        frontier: tuple[torch.Tensor, torch.Tensor | None] | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
-    ) -> LayeredForwardOutput:
-        return self.model.forward_layered_prefill(
-            input_ids=input_ids,
-            positions=positions,
-            layer_start=layer_start,
-            layer_end=layer_end,
-            frontier=frontier,
-            inputs_embeds=inputs_embeds,
-            intermediate_tensors=intermediate_tensors,
-        )
 
     def forward(
         self,

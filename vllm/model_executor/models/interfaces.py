@@ -52,7 +52,6 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.multimodal.registry import _ProcessorFactories
     from vllm.sequence import IntermediateTensors
-    from vllm.v1.core.layered_prefill import LayeredForwardOutput
     from vllm.tasks import ScoreType
     from vllm.v1.worker.encoder_cudagraph_defs import (
         EncoderCudaGraphCaptureInputs,
@@ -676,27 +675,6 @@ class SupportsPP(Protocol):
         Return [`IntermediateTensors`][vllm.sequence.IntermediateTensors] only
         for the last PP rank.
         """
-        ...
-
-
-@runtime_checkable
-class SupportsLayeredPrefill(Protocol):
-    """Opt-in model interface for the Phase 1 layered-prefill reference path."""
-
-    supports_layered_prefill: ClassVar[Literal[True]] = True
-
-    def forward_layered_prefill(
-        self,
-        *,
-        input_ids: Tensor | None,
-        positions: Tensor,
-        layer_start: int,
-        layer_end: int,
-        frontier: tuple[Tensor, Tensor | None] | None = None,
-        inputs_embeds: Tensor | None = None,
-        intermediate_tensors: "IntermediateTensors | None" = None,
-    ) -> "LayeredForwardOutput":
-        """Execute only the selected contiguous layer range for P rows."""
         ...
 
 
