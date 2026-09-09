@@ -423,6 +423,9 @@ class LayeredPrefillPolicy:
             )
         else:
             request.layered_prefill_num_groups = num_groups
+        # Keep the logical query identical to regular prefill.  The worker pads
+        # the physical batch for sequence-sharded execution, while scheduler
+        # bookkeeping and KV commit must still cover the complete prompt.
         request.layered_prefill_query_tokens = request.num_prompt_tokens
         request.layered_prefill_kv_reserved = False
 
