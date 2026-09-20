@@ -773,19 +773,27 @@ class Scheduler(SchedulerInterface):
         )
 
     def _layered_prefill_supported_for_scheduler(self) -> bool:
-        # The layered policy is connector-free and synchronous.  Prefix
-        # caching is supported: admission reuses completed blocks and every
-        # finished chunk publishes its blocks to the cache.  TP ranks consume
-        # the same SchedulerOutput through the normal worker broadcast, so TP
-        # does not need a scheduler-side gate; DP=1 is enforced by the Ascend
-        # platform until plan synchronization across DP/EP ranks is
-        # implemented.  Model capability is checked by the worker.
+        # The layered policy is connector-free.  With async scheduling the
+        # worker still receives strictly paired execute/sample calls, so the
+        # single frontier per request stays valid at PP=1; PP>1 keeps the
+        # gate because async PP replaces the token echo with a GPU broadcast
+        # ring that the layered one-send-per-step payload does not join.
+        # Prefix caching is supported: admission reuses completed blocks and
+        # every finished chunk publishes its blocks to the cache.  TP ranks
+        # consume the same SchedulerOutput through the normal worker
+        # broadcast, so TP does not need a scheduler-side gate; DP=1 is
+        # enforced by the Ascend platform until plan synchronization across
+        # DP/EP ranks is implemented.  Model capability is checked by the
+        # worker.
         parallel_config = self.parallel_config
         kv_transfer_config = self.vllm_config.kv_transfer_config
         layered_config = self.layered_prefill_policy.config
         return bool(
             parallel_config.pipeline_parallel_size >= 1
-            and not self.scheduler_config.async_scheduling
+            and not (
+                self.scheduler_config.async_scheduling
+                and parallel_config.pipeline_parallel_size > 1
+            )
             and not getattr(parallel_config, "enable_dbo", False)
             and (
                 not layered_config.require_eager

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.v1.core.layered_prefill import (
     LayeredFrontier,
     LayeredPrefillConfig,
@@ -15,6 +16,10 @@ from vllm.v1.core.layered_prefill import (
     make_pp_aligned_layer_group_ranges,
     select_num_groups,
 )
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.request import RequestStatus
 
 
 def _config(
@@ -138,6 +143,7 @@ def test_policy_initializes_request_and_advances_groups():
     request = SimpleNamespace(
         request_id="req",
         num_prompt_tokens=513,
+        num_computed_tokens=0,
         layered_prefill_enabled=False,
         layered_prefill_group_id=0,
         layered_prefill_num_groups=0,
@@ -169,6 +175,7 @@ def test_policy_aligns_pp_groups_with_stage_partitions():
     request = SimpleNamespace(
         request_id="req",
         num_prompt_tokens=1,
+        num_computed_tokens=0,
         layered_prefill_enabled=False,
         layered_prefill_group_id=0,
         layered_prefill_num_groups=0,
@@ -191,6 +198,7 @@ def test_policy_keeps_unaligned_tail_in_layered_query():
     request = SimpleNamespace(
         request_id="req",
         num_prompt_tokens=65540,
+        num_computed_tokens=0,
         layered_prefill_enabled=False,
         layered_prefill_group_id=0,
         layered_prefill_num_groups=0,
@@ -256,3 +264,109 @@ def test_config_parses_phase_one_scheduler_options():
 def test_config_rejects_multiple_groups_per_step_in_phase_one():
     with pytest.raises(ValueError, match="max_groups_per_step=1"):
         LayeredPrefillConfig(enabled=True, max_groups_per_step=2)
+
+
+_LAYERED_ASYNC_ADDITIONAL_CONFIG = {
+    "scheduler_config": {
+        "layered_prefill_config": {
+            "enabled": True,
+            # The test model is not forced eager and the cohort runs without
+            # Decode work, so relax the phase-one eligibility knobs.
+            "require_eager": False,
+            "require_pd_mixed": False,
+        }
+    }
+}
+
+
+def _run_async_step(scheduler: Scheduler, sched_output: SchedulerOutput) -> None:
+    """Emulate the worker for one scheduler step.
+
+    Only the final layer group of the final chunk samples a token; every
+    other scheduled row (regular Decode or an intermediate layer group)
+    returns none, mirroring the layered worker protocol.
+    """
+    plan = sched_output.layered_prefill_plan
+    req_ids = list(sched_output.num_scheduled_tokens)
+    sampled_token_ids = [
+        [0]
+        if plan is None or plan.is_sampling_step or req_id not in plan.query_tokens
+        else []
+        for req_id in req_ids
+    ]
+    model_runner_output = ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+        sampled_token_ids=sampled_token_ids,
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(sched_output, model_runner_output)
+
+
+@pytest.mark.cpu_test
+def test_async_scheduler_layered_prefill_placeholder_protocol():
+    """The layered request's first sampled token must be accounted as an
+    async output placeholder when the final layer group is scheduled, and
+    cleared once the worker delivers the token."""
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=520, max_tokens=2, ignore_eos=True
+    )
+    scheduler.add_request(request)
+
+    sched_output = scheduler.schedule()
+    plan = sched_output.layered_prefill_plan
+    assert plan is not None and plan.num_groups == 2
+    # Intermediate layer group: the request executes but samples nothing.
+    assert not plan.is_sampling_step
+    assert request.num_output_placeholders == 0
+    _run_async_step(scheduler, sched_output)
+    assert request.num_output_placeholders == 0
+
+    sched_output = scheduler.schedule()
+    plan = sched_output.layered_prefill_plan
+    assert plan is not None and plan.is_sampling_step
+    # The step samples the request's first output token, so the async
+    # protocol requires one placeholder at schedule time.
+    assert request.num_output_placeholders == 1
+    _run_async_step(scheduler, sched_output)
+    assert request.num_output_placeholders == 0
+
+    # The prompt finished; the request graduates to regular async decode.
+    sched_output = scheduler.schedule()
+    assert sched_output.layered_prefill_plan is None
+    assert request.num_output_placeholders == 1
+    _run_async_step(scheduler, sched_output)
+    assert request.num_output_placeholders == 0
+    assert request.num_output_tokens == 2
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
+@pytest.mark.cpu_test
+def test_async_scheduler_layered_prefill_gate_falls_back_for_pp2():
+    """async scheduling with PP>1 stays on regular token scheduling."""
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+    )
+    # Emulate PP>1 at the scheduler level; constructing with
+    # pipeline_parallel_size>1 requires that many visible GPUs.
+    scheduler.parallel_config.pipeline_parallel_size = 2
+    assert not scheduler._layered_prefill_supported_for_scheduler()
+
+    (request,) = create_requests(
+        num_requests=1, num_tokens=520, max_tokens=2, ignore_eos=True
+    )
+    scheduler.add_request(request)
+    sched_output = scheduler.schedule()
+    assert sched_output.layered_prefill_plan is None
+    assert not request.layered_prefill_enabled
