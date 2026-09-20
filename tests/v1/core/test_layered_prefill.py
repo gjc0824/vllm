@@ -17,7 +17,10 @@ from vllm.v1.core.layered_prefill import (
     select_num_groups,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import (
+    _LAYERED_STALL_RECOVERY_STEPS,
+    Scheduler,
+)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
@@ -370,3 +373,94 @@ def test_async_scheduler_layered_prefill_gate_falls_back_for_pp2():
     sched_output = scheduler.schedule()
     assert sched_output.layered_prefill_plan is None
     assert not request.layered_prefill_enabled
+
+
+@pytest.mark.cpu_test
+def test_layered_admission_failure_does_not_starve_decode():
+    """When the waiting candidate's full-prompt reservation fails, the step
+    must fall back to regular scheduling with the full token budget so the
+    running request's Decode rows keep executing, instead of the doomed
+    candidate's query budget starving them into zero-token steps."""
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+    )
+    first, blocked = create_requests(
+        num_requests=2, num_tokens=520, max_tokens=8, ignore_eos=True
+    )
+    scheduler.add_request(first)
+    scheduler.add_request(blocked)
+
+    # The first request runs through its two layer groups and samples.
+    for _ in range(2):
+        sched_output = scheduler.schedule()
+        assert sched_output.total_num_scheduled_tokens > 0
+        assert scheduler._layered_stall_steps == 0
+        _run_async_step(scheduler, sched_output)
+
+    # `first` is now a decode request. Fail every full-prompt reservation
+    # (the pool cannot fit a second request) while small decode allocations
+    # keep succeeding.
+    kv_cache_manager = scheduler.kv_cache_manager
+    original_allocate_slots = kv_cache_manager.allocate_slots
+
+    def fail_full_prompt_reservations(request, num_new_tokens, *args, **kwargs):
+        if num_new_tokens > 100:
+            return None
+        return original_allocate_slots(request, num_new_tokens, *args, **kwargs)
+
+    kv_cache_manager.allocate_slots = fail_full_prompt_reservations
+    try:
+        for _ in range(3):
+            sched_output = scheduler.schedule()
+            # The decode row survives the failed layered admission.
+            assert sched_output.total_num_scheduled_tokens == 1
+            assert first.status == RequestStatus.RUNNING
+            assert blocked.status == RequestStatus.WAITING
+            assert scheduler._layered_stall_steps == 0
+            _run_async_step(scheduler, sched_output)
+    finally:
+        kv_cache_manager.allocate_slots = original_allocate_slots
+
+    # With the reservation restorable the waiting request is admitted again.
+    sched_output = scheduler.schedule()
+    assert blocked.status == RequestStatus.RUNNING
+    assert sched_output.total_num_scheduled_tokens > 0
+
+
+@pytest.mark.cpu_test
+def test_layered_stall_watchdog_preempts_unschedulable_running_request():
+    """The stall watchdog is the backstop for zero-token steps that regular
+    preemption cannot resolve, e.g. a running request whose decode rows are
+    deferred indefinitely with no waiting request to drive admission."""
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+    )
+    (wedged,) = create_requests(
+        num_requests=1, num_tokens=520, max_tokens=4, ignore_eos=True
+    )
+    scheduler.add_request(wedged)
+
+    for _ in range(2):
+        sched_output = scheduler.schedule()
+        assert sched_output.total_num_scheduled_tokens > 0
+        _run_async_step(scheduler, sched_output)
+
+    wedged.next_decode_eligible_step = 10**9
+    for step in range(_LAYERED_STALL_RECOVERY_STEPS):
+        assert scheduler.schedule().total_num_scheduled_tokens == 0
+    assert step == _LAYERED_STALL_RECOVERY_STEPS - 1
+
+    assert wedged.status == RequestStatus.PREEMPTED
+    assert wedged not in scheduler.running
+    assert wedged in scheduler.waiting
+    assert scheduler._layered_stall_steps == 0
+
+    sched_output = scheduler.schedule()
+    assert sched_output.total_num_scheduled_tokens > 0
+    assert wedged.status == RequestStatus.RUNNING

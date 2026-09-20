@@ -72,6 +72,10 @@ logger = init_logger(__name__)
 
 _LAYERED_PREFILL_TRACE = os.getenv("VLLM_LAYERED_PREFILL_TRACE") == "1"
 
+# Zero-token layered steps tolerated before the stall recovery preempts the
+# head-of-line running request to return its KV reservation to the pool.
+_LAYERED_STALL_RECOVERY_STEPS = 64
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -89,6 +93,7 @@ class Scheduler(SchedulerInterface):
         self.scheduler_config = vllm_config.scheduler_config
         self.layered_prefill_policy = LayeredPrefillPolicy(vllm_config)
         self._hold_layered_prefills = False
+        self._layered_stall_steps = 0
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
@@ -448,7 +453,9 @@ class Scheduler(SchedulerInterface):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """Schedule one step, optionally using the layered-prefill policy."""
         if self.layered_prefill_policy.enabled:
-            return self._schedule_layered_prefill(throttle_prefills)
+            scheduler_output = self._schedule_layered_prefill(throttle_prefills)
+            self._check_layered_stall(scheduler_output)
+            return scheduler_output
         return self._schedule_regular(throttle_prefills)
 
     def _schedule_layered_prefill(
@@ -505,36 +512,21 @@ class Scheduler(SchedulerInterface):
             RequestStatus.PREEMPTED,
         )
         request_is_new = admission_status == RequestStatus.WAITING
+
+        # A running request already owns its prompt blocks.  A newly admitted
+        # request is removed from the waiting queue and reserves them exactly
+        # once; every later group reuses the reservation.  Admission runs
+        # before the token budget is carved: a failed reservation must fall
+        # back to regular scheduling with the full budget, or the doomed
+        # candidate's query budget would starve the running Decode rows and
+        # wedge the engine in zero-token steps.
         if request_needs_admission:
             # Keep the candidate out of the regular waiting traversal while it
             # admits Decode requests.  It is requeued if the reservation fails.
             self._remove_layered_candidate_from_waiting(candidate)
-
-        old_max_tokens = self.max_num_scheduled_tokens
-        self.max_num_scheduled_tokens = old_max_tokens - query_tokens
-        self._hold_layered_prefills = True
-        try:
-            scheduler_output = self._schedule_regular(throttle_prefills)
-        finally:
-            self._hold_layered_prefills = False
-            self.max_num_scheduled_tokens = old_max_tokens
-
-        if not request_needs_admission and (
-            not candidate.layered_prefill_enabled
-            or candidate.status != RequestStatus.RUNNING
-        ):
-            # The regular admission path may have preempted this request to
-            # make room for a higher-priority Decode request.  Its preemption
-            # handler already reset the frontier metadata and requeued it.
-            return scheduler_output
-
-        # A running request already owns its prompt blocks.  A newly admitted
-        # request is removed from the waiting queue and reserves them exactly
-        # once; every later group reuses the reservation.
-        if request_needs_admission:
             if len(self.running) >= self.max_num_running_reqs:
                 self._requeue_layered_candidate(candidate, admission_status)
-                return scheduler_output
+                return self._schedule_regular(throttle_prefills)
             # Prefix-cache lookup mirrors the regular waiting path.  Cached
             # blocks are complete for every layer once the producing request
             # finished its cohort, so layered requests may reuse them.
@@ -559,7 +551,7 @@ class Scheduler(SchedulerInterface):
                 if candidate.layered_prefill_group_id == 0:
                     reset_layered_prefill_request(candidate)
                 self._requeue_layered_candidate(candidate, admission_status)
-                return scheduler_output
+                return self._schedule_regular(throttle_prefills)
             if num_computed_tokens != candidate.num_computed_tokens:
                 candidate.num_computed_tokens = num_computed_tokens
                 # Re-plan the first chunk from the cache-hit position so
@@ -571,6 +563,32 @@ class Scheduler(SchedulerInterface):
             candidate.status = RequestStatus.RUNNING
             self.running.append(candidate)
             self._inflight_prefills.add(candidate)
+        elif not candidate.layered_prefill_kv_reserved:
+            # This branch is only reachable for a request restored by an
+            # external scheduler implementation.  Preserve the same invariant
+            # rather than silently appending duplicate blocks.
+            raise RuntimeError(
+                f"Layered request {candidate.request_id} has no KV reservation"
+            )
+
+        old_max_tokens = self.max_num_scheduled_tokens
+        self.max_num_scheduled_tokens = old_max_tokens - query_tokens
+        self._hold_layered_prefills = True
+        try:
+            scheduler_output = self._schedule_regular(throttle_prefills)
+        finally:
+            self._hold_layered_prefills = False
+            self.max_num_scheduled_tokens = old_max_tokens
+
+        if not candidate.layered_prefill_enabled or (
+            candidate.status != RequestStatus.RUNNING
+        ):
+            # The regular admission path may have preempted this request to
+            # make room for a higher-priority Decode request.  Its preemption
+            # handler already reset the frontier metadata and requeued it.
+            return scheduler_output
+
+        if request_needs_admission:
             layered_zero_ids = self._get_new_block_ids_to_zero()
             if layered_zero_ids:
                 existing_zero_ids = scheduler_output.new_block_ids_to_zero or []
@@ -603,13 +621,6 @@ class Scheduler(SchedulerInterface):
                 self._append_cached_request_data(
                     scheduler_output.scheduled_cached_reqs, cached
                 )
-        elif not candidate.layered_prefill_kv_reserved:
-            # This branch is only reachable for a request restored by an
-            # external scheduler implementation.  Preserve the same invariant
-            # rather than silently appending duplicate blocks.
-            raise RuntimeError(
-                f"Layered request {candidate.request_id} has no KV reservation"
-            )
 
         req_id = candidate.request_id
         scheduler_output.num_scheduled_tokens[req_id] = query_tokens
@@ -675,6 +686,30 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         request.status = status
         self.waiting.prepend_request(request)
+
+    def _check_layered_stall(self, scheduler_output: SchedulerOutput) -> None:
+        # A healthy layered step schedules something whenever unfinished
+        # requests exist: a pending request is the candidate on its
+        # already-reserved KV, and Decode rows go through the regular path.
+        # A zero-token step means every running request is blocked and the
+        # candidate's full-prompt admission keeps failing; preempting the
+        # head-of-line request returns its KV blocks so the candidate can
+        # proceed, trading one recompute for unwedging the engine.
+        if (
+            scheduler_output.total_num_scheduled_tokens
+            or not self.has_unfinished_requests()
+            or self._pause_state != PauseState.UNPAUSED
+        ):
+            self._layered_stall_steps = 0
+            return
+        self._layered_stall_steps += 1
+        if self._layered_stall_steps < _LAYERED_STALL_RECOVERY_STEPS:
+            return
+        self._layered_stall_steps = 0
+        if not self.running:
+            return
+        victim = self.running[0]
+        self._reset_or_preempt_layered_request(victim)
 
     def _reset_or_preempt_layered_request(self, request: Request) -> None:
         """Drop partial layered state before falling back to token scheduling."""
