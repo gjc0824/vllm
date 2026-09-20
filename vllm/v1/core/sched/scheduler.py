@@ -543,7 +543,7 @@ class Scheduler(SchedulerInterface):
                 candidate.num_prompt_tokens - num_computed_tokens,
                 num_new_computed_tokens=num_computed_tokens,
                 new_computed_blocks=new_computed_blocks,
-                num_lookahead_tokens=0,
+                num_lookahead_tokens=self.num_lookahead_tokens,
                 delay_cache_blocks=True,
                 has_scheduled_reqs=bool(self.running),
             )
