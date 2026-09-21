@@ -53,6 +53,9 @@ class LayeredPrefillConfig:
     max_groups_per_step: int = 1
     require_pd_mixed: bool = True
     require_eager: bool = True
+    # Use a mixed forward when supported; False retains the split reference path.
+    single_forward: bool = True
+    single_forward_decode_graph: bool = True
 
     def __post_init__(self) -> None:
         groups = tuple(sorted(set(int(v) for v in self.allowed_num_groups)))
@@ -110,6 +113,8 @@ class LayeredPrefillConfig:
             max_groups_per_step=int(raw.get("max_groups_per_step", 1)),
             require_pd_mixed=bool(raw.get("require_pd_mixed", True)),
             require_eager=bool(raw.get("require_eager", True)),
+            single_forward=bool(raw.get("single_forward", True)),
+            single_forward_decode_graph=bool(raw.get("single_forward_decode_graph", True)),
         )
 
 
