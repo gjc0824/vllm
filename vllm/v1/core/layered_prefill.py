@@ -56,6 +56,7 @@ class LayeredPrefillConfig:
     # Use a mixed forward when supported; False retains the split reference path.
     single_forward: bool = True
     single_forward_decode_graph: bool = True
+    single_forward_compile: bool = True
 
     def __post_init__(self) -> None:
         groups = tuple(sorted(set(int(v) for v in self.allowed_num_groups)))
@@ -115,6 +116,7 @@ class LayeredPrefillConfig:
             require_eager=bool(raw.get("require_eager", True)),
             single_forward=bool(raw.get("single_forward", True)),
             single_forward_decode_graph=bool(raw.get("single_forward_decode_graph", True)),
+            single_forward_compile=bool(raw.get("single_forward_compile", True)),
         )
 
 
