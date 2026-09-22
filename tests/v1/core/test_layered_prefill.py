@@ -353,6 +353,61 @@ def test_async_scheduler_layered_prefill_placeholder_protocol():
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2])
+def test_async_scheduler_layered_prefill_first_decode_step_has_no_draft_slots(
+    num_speculative_tokens: int,
+):
+    """The layered request's first decode step schedules no draft slots.
+
+    The async placeholder loop in ``_update_after_schedule`` runs before the
+    layered append, so the request's spec_token_ids stay empty when the final
+    layer group samples.  Draft slots only appear from the step after its
+    first decode step.  This is the contract that lets the worker skip the
+    layered P subbatch's propose under async scheduling without losing any
+    consumer.
+    """
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+        num_speculative_tokens=num_speculative_tokens,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=520, max_tokens=6, ignore_eos=True
+    )
+    scheduler.add_request(request)
+    req_id = request.request_id
+
+    # Intermediate group: no sampling, no draft slots.
+    sched_output = scheduler.schedule()
+    assert sched_output.layered_prefill_plan is not None
+    assert req_id not in sched_output.scheduled_spec_decode_tokens
+    _run_async_step(scheduler, sched_output)
+
+    # Final group samples the first token; still no draft slots.
+    sched_output = scheduler.schedule()
+    assert sched_output.layered_prefill_plan is not None
+    assert sched_output.layered_prefill_plan.is_sampling_step
+    assert req_id not in sched_output.scheduled_spec_decode_tokens
+    _run_async_step(scheduler, sched_output)
+
+    # First decode step: exactly one token, no draft slots.
+    sched_output = scheduler.schedule()
+    assert sched_output.layered_prefill_plan is None
+    assert req_id not in sched_output.scheduled_spec_decode_tokens
+    assert sched_output.num_scheduled_tokens[req_id] == 1
+    _run_async_step(scheduler, sched_output)
+
+    # From the next step on, regular async spec decode provides the slots.
+    sched_output = scheduler.schedule()
+    assert sched_output.layered_prefill_plan is None
+    draft_slots = sched_output.scheduled_spec_decode_tokens[req_id]
+    assert len(draft_slots) == num_speculative_tokens
+    assert sched_output.num_scheduled_tokens[req_id] == 1 + num_speculative_tokens
+
+
+@pytest.mark.cpu_test
 def test_async_scheduler_layered_prefill_gate_falls_back_for_pp2():
     """async scheduling with PP>1 stays on regular token scheduling."""
     scheduler = create_scheduler(
