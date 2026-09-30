@@ -138,6 +138,7 @@ def test_policy_initializes_request_and_advances_groups():
     request = SimpleNamespace(
         request_id="req",
         num_prompt_tokens=513,
+        num_computed_tokens=0,
         layered_prefill_enabled=False,
         layered_prefill_group_id=0,
         layered_prefill_num_groups=0,
@@ -169,6 +170,7 @@ def test_policy_aligns_pp_groups_with_stage_partitions():
     request = SimpleNamespace(
         request_id="req",
         num_prompt_tokens=1,
+        num_computed_tokens=0,
         layered_prefill_enabled=False,
         layered_prefill_group_id=0,
         layered_prefill_num_groups=0,
@@ -191,6 +193,7 @@ def test_policy_keeps_unaligned_tail_in_layered_query():
     request = SimpleNamespace(
         request_id="req",
         num_prompt_tokens=65540,
+        num_computed_tokens=0,
         layered_prefill_enabled=False,
         layered_prefill_group_id=0,
         layered_prefill_num_groups=0,
@@ -256,3 +259,37 @@ def test_config_parses_phase_one_scheduler_options():
 def test_config_rejects_multiple_groups_per_step_in_phase_one():
     with pytest.raises(ValueError, match="max_groups_per_step=1"):
         LayeredPrefillConfig(enabled=True, max_groups_per_step=2)
+
+
+def test_layered_full_batch_keeps_decode_budget_until_admission_slot_is_free():
+    from unittest.mock import Mock
+
+    from vllm.v1.core.sched.interface import PauseState
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.request import RequestStatus
+
+    scheduler = Scheduler.__new__(Scheduler)
+    config = _config()
+    config.additional_config["scheduler_config"]["layered_prefill_config"][
+        "require_pd_mixed"
+    ] = False
+    scheduler.layered_prefill_policy = LayeredPrefillPolicy(config)
+    scheduler._pause_state = PauseState.UNPAUSED
+    scheduler.max_num_scheduled_tokens = 257
+    scheduler.max_num_running_reqs = 8
+    scheduler.running = [object()] * 8
+    candidate = SimpleNamespace(
+        status=RequestStatus.WAITING, layered_prefill_query_tokens=257
+    )
+    scheduler._get_layered_prefill_candidate = Mock(return_value=candidate)
+    scheduler._layered_prefill_supported_for_scheduler = Mock(return_value=True)
+    scheduler._remove_layered_candidate_from_waiting = Mock()
+    expected = object()
+
+    def regular(_):
+        assert scheduler.max_num_scheduled_tokens == 257
+        return expected
+
+    scheduler._schedule_regular = regular
+    assert scheduler.schedule() is expected
+    scheduler._remove_layered_candidate_from_waiting.assert_not_called()

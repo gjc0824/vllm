@@ -505,6 +505,10 @@ class Scheduler(SchedulerInterface):
             RequestStatus.PREEMPTED,
         )
         request_is_new = admission_status == RequestStatus.WAITING
+        if request_needs_admission and len(self.running) >= self.max_num_running_reqs:
+            # Do not reserve the entire token budget for a P request that
+            # cannot enter the batch. Decode must progress and release a slot.
+            return self._schedule_regular(throttle_prefills)
         if request_needs_admission:
             # Keep the candidate out of the regular waiting traversal while it
             # admits Decode requests.  It is requeued if the reservation fails.

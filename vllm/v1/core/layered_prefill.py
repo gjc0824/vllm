@@ -11,10 +11,10 @@ they can safely cross the EngineCore/worker process boundary.
 from __future__ import annotations
 
 from bisect import bisect_left
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from math import ceil
-from typing import Any, Mapping
-
+from typing import Any
 
 DEFAULT_GROUP_TOKEN_TARGET = 512
 DEFAULT_ALLOWED_NUM_GROUPS = (1, 2, 4, 8, 16)
@@ -84,7 +84,7 @@ class LayeredPrefillConfig:
             )
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: Any) -> "LayeredPrefillConfig":
+    def from_vllm_config(cls, vllm_config: Any) -> LayeredPrefillConfig:
         additional_config = getattr(vllm_config, "additional_config", None) or {}
         if not isinstance(additional_config, dict):
             return cls()
