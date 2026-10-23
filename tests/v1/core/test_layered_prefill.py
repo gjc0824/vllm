@@ -846,10 +846,13 @@ def test_async_in_flight_holds_waiting_prompt(monkeypatch: pytest.MonkeyPatch):
     assert first_g0.layered_prefill_plan is not None
     assert second.request_id not in first_g0.num_scheduled_tokens
 
+    continued = scheduler.schedule()
+    assert continued.layered_prefill_plan.group_id == 1
+    assert continued.layered_prefill_plan.prefill_req_ids == (first.request_id,)
+    assert second.request_id not in continued.num_scheduled_tokens
     held = scheduler.schedule()
     assert held.layered_prefill_plan is None
     assert second.request_id not in held.num_scheduled_tokens
-    assert first.request_id not in held.num_scheduled_tokens
 
 
 def test_pp2_admits_independent_prompt_without_advancing_inflight_frontier():
@@ -1193,9 +1196,7 @@ def test_boundary_isolated_rechecks_successor_at_stage_end_at_depth_two(
         if len(queue) == 2:
             completed = queue.popleft()
             scheduler.update_from_output(completed, _wavefront_output(completed))
-        if not added_successor and (
-            arrive_before_stage_end or plan.group_end == 16
-        ):
+        if not added_successor and (arrive_before_stage_end or plan.group_end == 16):
             scheduler.max_num_running_reqs = 3
             scheduler.add_request(successor)
             added_successor = True
@@ -1210,9 +1211,7 @@ def test_boundary_isolated_rechecks_successor_at_stage_end_at_depth_two(
     if arrive_before_stage_end:
         assert plans[-1].group_start < 16 < plans[-1].group_end
     else:
-        assert all(
-            plan.group_end <= 16 or plan.group_start >= 16 for plan in plans
-        )
+        assert all(plan.group_end <= 16 or plan.group_start >= 16 for plan in plans)
 
     final_seq = scheduler._boundary_final_step_seq
     assert scheduler.processed_step_seq == final_seq - 1
@@ -1668,9 +1667,7 @@ def test_boundary_isolated_policy_exits_only_before_pp0_completion(
     if arrive_before_stage_end:
         assert plans[-1].group_start < 22 < plans[-1].group_end
     else:
-        assert all(
-            plan.group_end <= 22 or plan.group_start >= 22 for plan in plans
-        )
+        assert all(plan.group_end <= 22 or plan.group_start >= 22 for plan in plans)
 
 
 @pytest.mark.parametrize("groups", [4, 8, 16])
@@ -2077,16 +2074,17 @@ def test_layered_stall_watchdog_preempts_unschedulable_running_request():
     assert wedged.status == RequestStatus.RUNNING
 
 
-def _wavefront_scheduler(groups=2, layers=32, **kwargs):
+def _wavefront_scheduler(groups=2, layers=32, *, async_scheduling=False, **kwargs):
     scheduler = _local_scheduler(
         max_num_seqs=3,
         max_num_batched_tokens=16,
         use_v2_model_runner=True,
-        async_scheduling=False,
+        async_scheduling=async_scheduling,
         num_hidden_layers=layers,
         **kwargs,
     )
     scheduler.parallel_config.pipeline_parallel_size = 2
+    scheduler.pp_size = 2
     scheduler.use_pp = True
     _enable_layered_scheduler(
         scheduler,
@@ -2094,6 +2092,372 @@ def _wavefront_scheduler(groups=2, layers=32, **kwargs):
         max_chunk_tokens=4,
     )
     return scheduler
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("groups", [2, 4, 16])
+@pytest.mark.parametrize("with_decode", [False, True])
+def test_async_pp2_wave_overlaps_cohorts_at_engine_queue_depth(groups, with_decode):
+    """PP+1 queued RPCs retain wave overlap and drain before the next chunk."""
+    from collections import deque
+
+    from tests.v1.core.utils import create_requests
+
+    scheduler = _wavefront_scheduler(groups, layers=43, async_scheduling=True)
+    if with_decode:
+        _add_ready_decode(scheduler)
+    first, second = create_requests(
+        num_requests=2,
+        num_tokens=8,
+        max_tokens=1,
+        req_ids=["async_wave_a", "async_wave_b"],
+    )
+    for req in (first, second):
+        scheduler.add_request(req)
+    queue = deque()
+    sequence = []
+    frontiers = {}
+    first_stage1 = None
+    overlapping_admission = False
+    for _ in range(8 * groups + 32):
+        before_flight = {r.request_id: r.num_in_flight_tokens for r in (first, second)}
+        step = scheduler.schedule()
+        plan = step.layered_prefill_plan
+        if plan is not None:
+            rid = plan.prefill_req_ids[0]
+            chunk = plan.cached_tokens[rid]
+            key = (rid, chunk)
+            assert plan.group_id == frontiers.get(key, 0)
+            frontiers[key] = plan.group_id + 1
+            if plan.group_id == 0:
+                assert before_flight[rid] == 0
+            sequence.append((rid, plan.group_id, chunk))
+            if (
+                rid == first.request_id
+                and chunk == 0
+                and plan.group_start >= 22
+                and first_stage1 is None
+            ):
+                first_stage1 = len(sequence) - 1
+            if rid == second.request_id and chunk == 0 and plan.group_id == 0:
+                assert first_stage1 is not None
+                assert len(sequence) - 1 == first_stage1 + 1
+                assert before_flight[first.request_id] > 0
+                overlapping_admission = True
+        queue.append(step)
+        if len(queue) == 3:
+            completed = queue.popleft()
+            scheduler.update_from_output(completed, _wavefront_output(completed))
+        assert all(r.num_in_flight_tokens >= 0 for r in (first, second))
+        if first.num_output_tokens == second.num_output_tokens == 1:
+            break
+    while queue:
+        completed = queue.popleft()
+        scheduler.update_from_output(completed, _wavefront_output(completed))
+    assert overlapping_admission
+    assert len(sequence) == 4 * groups
+    assert set(frontiers.values()) == {groups}
+    for req in (first, second):
+        assert req.num_computed_tokens == 8
+        assert req.num_in_flight_tokens == req.num_output_placeholders == 0
+        assert req.num_output_tokens == 1
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("action", ["abort", "preempt"])
+def test_async_pp2_wave_interrupt_preserves_other_cohort_and_stale_fence(action):
+    from collections import deque
+
+    from tests.v1.core.utils import create_requests
+    from vllm.v1.request import RequestStatus
+
+    scheduler = _wavefront_scheduler(4, async_scheduling=True)
+    scheduler.defer_block_free = True
+    first, second = create_requests(
+        num_requests=2,
+        num_tokens=8,
+        max_tokens=1,
+        req_ids=["interrupt_a", "interrupt_b"],
+    )
+    for req in (first, second):
+        scheduler.add_request(req)
+    queue = deque()
+    for _ in range(4):
+        step = scheduler.schedule()
+        queue.append(step)
+        if len(queue) == 3:
+            completed = queue.popleft()
+            scheduler.update_from_output(completed, _wavefront_output(completed))
+    assert queue[-1].layered_prefill_plan.prefill_req_ids == (second.request_id,)
+    assert first.num_in_flight_tokens == second.num_in_flight_tokens == 4
+    if action == "abort":
+        scheduler.finish_requests(first.request_id, RequestStatus.FINISHED_ABORTED)
+    else:
+        scheduler.running.remove(first)
+        scheduler._preempt_request(first, 0.0)
+        assert first.num_stale_output_tokens == 4
+    # The saved PP1 tail belongs to an interrupted generation. Its pending
+    # completion must drain; meanwhile the other cohort can still advance.
+    step = scheduler.schedule()
+    assert first.request_id not in step.num_scheduled_tokens
+    assert step.layered_prefill_plan.prefill_req_ids == (second.request_id,)
+    queue.append(step)
+    assert scheduler.deferred_frees
+    for _ in range(128):
+        if queue:
+            completed = queue.popleft()
+            scheduler.update_from_output(completed, _wavefront_output(completed))
+        if not scheduler.get_num_unfinished_requests() and not queue:
+            break
+        if scheduler.get_num_unfinished_requests():
+            queue.append(scheduler.schedule())
+    assert not scheduler.deferred_frees
+    if action == "abort":
+        assert first.request_id not in scheduler.requests
+        assert first not in scheduler.running
+    else:
+        assert first.num_stale_output_tokens == first.num_in_flight_tokens == 0
+    assert second.num_output_tokens == 1
+    assert first.num_output_tokens == (0 if action == "abort" else 1)
+    assert first.num_output_placeholders == second.num_output_placeholders == 0
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
+def _ordinary_async_scheduler(pp_size, *, groups=4, prefix_cache=False):
+    scheduler = _local_scheduler(
+        max_num_seqs=4,
+        max_num_batched_tokens=16,
+        use_v2_model_runner=True,
+        async_scheduling=True,
+        enable_prefix_caching=prefix_cache,
+    )
+    scheduler.parallel_config.pipeline_parallel_size = pp_size
+    scheduler.pp_size = pp_size
+    scheduler.use_pp = pp_size > 1
+    scheduler.defer_block_free = True
+    _enable_layered_scheduler(
+        scheduler,
+        allowed_num_groups=[groups],
+        boundary_policy="off",
+        max_chunk_tokens=4,
+    )
+    return scheduler
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("pp_size", [1, 2, 3, 4])
+@pytest.mark.parametrize("queue_depth", [1, None], ids=["serial", "engine_queue"])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("max_tokens", [1, 5])
+def test_ordinary_async_layered_chunks_finish_at_queue_depth(
+    pp_size, queue_depth, mixed, max_tokens
+):
+    """Actual schedule/retire cycles preserve chunk coverage and sample counts."""
+    from collections import deque
+
+    from tests.v1.core.utils import create_requests
+
+    scheduler = _ordinary_async_scheduler(pp_size)
+    if queue_depth is None:
+        # Match EngineCore's MRV2 async queue: PP ranks plus one overlap slot.
+        # Larger queues would also exceed the sampled-token ring's lifetime.
+        queue_depth = pp_size + 1
+    decodes = []
+    if mixed:
+        (decode,) = create_requests(
+            num_requests=1,
+            num_tokens=2,
+            max_tokens=20,
+            ignore_eos=True,
+            req_ids=["decode"],
+        )
+        scheduler.add_request(decode)
+        for _ in range(4):
+            step = scheduler.schedule()
+            scheduler.update_from_output(step, _wavefront_output(step))
+        assert decode.num_output_tokens == 1
+        decodes.append(decode)
+    prefills = create_requests(
+        num_requests=2,
+        num_tokens=9,
+        max_tokens=max_tokens,
+        ignore_eos=True,
+        req_ids=["p0", "p1"],
+    )
+    for request in prefills:
+        scheduler.add_request(request)
+    queue = deque()
+    coverage = {}
+    mixed_steps = 0
+    for _ in range(256):
+        step = scheduler.schedule()
+        plan = step.layered_prefill_plan
+        if plan is not None:
+            assert plan.boundary_mode is None
+            rid = plan.prefill_req_ids[0]
+            key = (rid, plan.cached_tokens[rid])
+            coverage.setdefault(key, []).extend(range(plan.group_start, plan.group_end))
+            mixed_steps += bool(set(step.num_scheduled_tokens) - {rid})
+        queue.append(step)
+        if len(queue) >= queue_depth:
+            completed = queue.popleft()
+            scheduler.update_from_output(completed, _wavefront_output(completed))
+        for request in prefills + decodes:
+            assert request.num_output_placeholders >= 0
+            assert request.num_preemptions == 0
+            assert request.num_output_tokens <= request.max_tokens
+        if not scheduler.get_num_unfinished_requests():
+            break
+    else:
+        pytest.fail("ordinary async layered requests failed to finish")
+    while queue:
+        completed = queue.popleft()
+        scheduler.update_from_output(completed, _wavefront_output(completed))
+    for request in prefills:
+        assert request.num_output_tokens == max_tokens
+        assert request.num_output_placeholders == 0
+        assert request.num_in_flight_tokens == 0
+        assert [coverage[(request.request_id, start)] for start in (0, 4, 8)] == [
+            list(range(32))
+        ] * 3
+    if mixed:
+        assert mixed_steps > 0
+    assert scheduler.sched_step_seq == scheduler.processed_step_seq
+    assert not scheduler.deferred_frees
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("pp_size", [1, 2, 3, 4])
+def test_ordinary_async_queues_same_chunk_but_drains_before_next_chunk(pp_size):
+    from tests.v1.core.utils import create_requests
+
+    scheduler = _ordinary_async_scheduler(pp_size)
+    (request,) = create_requests(num_requests=1, num_tokens=8, max_tokens=2)
+    scheduler.add_request(request)
+    queued = [scheduler.schedule() for _ in range(4)]
+    assert [step.layered_prefill_plan.group_id for step in queued] == list(range(4))
+    assert request.num_in_flight_tokens == 16
+    assert request.num_computed_tokens == 4
+    assert request.num_output_placeholders == 0
+    assert request.last_sched_seq == scheduler.sched_step_seq == 4
+    for step in queued:
+        assert scheduler.schedule().total_num_scheduled_tokens == 0
+        scheduler.update_from_output(step, _wavefront_output(step))
+    next_chunk = scheduler.schedule().layered_prefill_plan
+    assert next_chunk is not None and next_chunk.group_id == 0
+    assert next_chunk.cached_tokens[request.request_id] == 4
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("pp_size", [1, 2, 3, 4])
+@pytest.mark.parametrize("action", ["abort", "preempt"])
+def test_ordinary_async_queued_groups_keep_kv_until_abort_or_preempt_retires(
+    pp_size, action
+):
+    from vllm.v1.request import RequestStatus
+
+    from tests.v1.core.utils import create_requests
+
+    scheduler = _ordinary_async_scheduler(pp_size)
+    (request,) = create_requests(
+        num_requests=1, num_tokens=8, max_tokens=2, ignore_eos=True
+    )
+    scheduler.add_request(request)
+    queued = [scheduler.schedule(), scheduler.schedule()]
+    assert request.last_sched_seq == 2
+    if action == "abort":
+        scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    else:
+        scheduler.running.remove(request)
+        scheduler._preempt_request(request, 0.0)
+        assert request.num_stale_output_tokens == 8
+        # Layered admission must respect the same stale-generation drain as
+        # regular admission; otherwise it can restart on freed KV too early.
+        assert scheduler.schedule().total_num_scheduled_tokens == 0
+        assert request.status == RequestStatus.PREEMPTED
+    assert scheduler.deferred_frees
+    scheduler.update_from_output(queued[0], _wavefront_output(queued[0]))
+    assert scheduler.deferred_frees
+    scheduler.update_from_output(queued[1], _wavefront_output(queued[1]))
+    assert not scheduler.deferred_frees
+    if action == "abort":
+        assert request.request_id not in scheduler.requests
+        return
+    assert request.num_stale_output_tokens == request.num_in_flight_tokens == 0
+    resumed = scheduler.schedule()
+    assert resumed.layered_prefill_plan.group_id == 0
+    assert resumed.scheduled_new_reqs[0].req_id == request.request_id
+    scheduler.update_from_output(resumed, _wavefront_output(resumed))
+    for _ in range(64):
+        if not scheduler.get_num_unfinished_requests():
+            break
+        step = scheduler.schedule()
+        scheduler.update_from_output(step, _wavefront_output(step))
+    assert request.num_output_tokens == 2
+    assert request.num_output_placeholders == 0
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("pp_size", [1, 2, 3, 4])
+def test_ordinary_async_preempted_final_sample_drains_old_generation(pp_size):
+    from tests.v1.core.utils import create_requests
+
+    scheduler = _ordinary_async_scheduler(pp_size)
+    (request,) = create_requests(
+        num_requests=1, num_tokens=4, max_tokens=3, ignore_eos=True
+    )
+    scheduler.add_request(request)
+    queued = [scheduler.schedule() for _ in range(4)]
+    assert queued[-1].layered_prefill_plan.is_sampling_step
+    assert request.num_output_placeholders == 1
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, 0.0)
+    assert request.num_output_placeholders == 0
+    for step in queued:
+        assert scheduler.schedule().total_num_scheduled_tokens == 0
+        scheduler.update_from_output(step, _wavefront_output(step))
+        assert request.num_output_placeholders == 0
+    # The old generation's real sample is delivered exactly once without
+    # consuming a placeholder from the resumed generation.
+    assert request.num_output_tokens == 1
+    assert request.num_stale_output_tokens == request.num_in_flight_tokens == 0
+    assert not scheduler.deferred_frees
+    for _ in range(32):
+        if not scheduler.get_num_unfinished_requests():
+            break
+        step = scheduler.schedule()
+        scheduler.update_from_output(step, _wavefront_output(step))
+    assert request.num_output_tokens == 3
+    assert request.num_output_placeholders == 0
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
+@pytest.mark.cpu_test
+def test_ordinary_async_prefix_cache_waits_for_final_group_retirement(monkeypatch):
+    from tests.v1.core.utils import create_requests
+
+    scheduler = _ordinary_async_scheduler(1, groups=2, prefix_cache=True)
+    (request,) = create_requests(num_requests=1, num_tokens=4, max_tokens=4)
+    scheduler.add_request(request)
+    published = []
+    cache_blocks = scheduler.kv_cache_manager.cache_blocks
+
+    def record_cache(req, computed):
+        published.append(computed)
+        return cache_blocks(req, computed)
+
+    monkeypatch.setattr(scheduler.kv_cache_manager, "cache_blocks", record_cache)
+    first, final = scheduler.schedule(), scheduler.schedule()
+    assert not published
+    decode = scheduler.schedule()
+    assert decode.layered_prefill_plan is None
+    assert request.num_computed_tokens == 5
+    scheduler.update_from_output(first, _wavefront_output(first))
+    assert not published
+    scheduler.update_from_output(final, _wavefront_output(final))
+    assert published and max(published) == 4
+    scheduler.update_from_output(decode, _wavefront_output(decode))
 
 
 def _wavefront_output(step):
@@ -2695,7 +3059,13 @@ def test_ring_step_plan_survives_scheduler_output_copy_and_transport():
 
 
 def _decode_first_boundary_scheduler(
-    *, groups=4, budget=8, num_decodes=1, max_num_seqs=6, chunk_threshold=0
+    *,
+    groups=4,
+    budget=8,
+    num_decodes=1,
+    max_num_seqs=6,
+    chunk_threshold=0,
+    async_scheduling=False,
 ):
     """Bootstrap ready D rows, then enable the opt-in boundary cohort policy."""
     from tests.v1.core.utils import create_requests
@@ -2705,11 +3075,13 @@ def _decode_first_boundary_scheduler(
         max_num_batched_tokens=budget,
         max_model_len=16384,
         use_v2_model_runner=True,
-        async_scheduling=False,
+        async_scheduling=async_scheduling,
     )
     scheduler.parallel_config.pipeline_parallel_size = 2
     scheduler.parallel_config.tensor_parallel_size = 2
     scheduler.use_pp = True
+    if async_scheduling:
+        scheduler.pp_size = 2
     decodes = create_requests(
         num_requests=num_decodes,
         num_tokens=2,
@@ -2735,9 +3107,103 @@ def _decode_first_boundary_scheduler(
     # Boundary admission deliberately needs retired D-only history. Enabling
     # the policy after bootstrap must therefore observe one policy-owned D step.
     decode_only = scheduler.schedule()
+    if async_scheduling and not decode_only.total_num_scheduled_tokens:
+        # PP2's first decode waits for the broadcast ring's second slot.
+        scheduler.update_from_output(decode_only, _cohort_wavefront_output(decode_only))
+        decode_only = scheduler.schedule()
     assert decode_only.layered_prefill_plan is None
     scheduler.update_from_output(decode_only, _cohort_wavefront_output(decode_only))
     return scheduler, decodes
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("max_prefill_batch_size", [1, 2])
+def test_async_boundary_samples_subset_once_at_queue_depth_two(max_prefill_batch_size):
+    from collections import deque
+    from dataclasses import replace
+
+    from tests.v1.core.utils import create_requests
+
+    scheduler, _ = _decode_first_boundary_scheduler(
+        groups=4, budget=8, async_scheduling=True
+    )
+    scheduler.layered_prefill_policy.config = replace(
+        scheduler.layered_prefill_policy.config,
+        max_prefill_batch_size=max_prefill_batch_size,
+    )
+    (short,) = create_requests(
+        num_requests=1, num_tokens=2, max_tokens=1, req_ids=["short"]
+    )
+    scheduler.add_request(short)
+    long = None
+    if max_prefill_batch_size == 2:
+        (long,) = create_requests(
+            num_requests=1, num_tokens=8, max_tokens=4, req_ids=["long"]
+        )
+        scheduler.add_request(long)
+
+    queue = deque()
+    plans = []
+    for _ in range(20):
+        step = scheduler.schedule()
+        queue.append(step)
+        plan = step.layered_prefill_plan
+        if plan is not None:
+            plans.append(plan)
+            if plan.is_final_group:
+                assert short.num_output_placeholders == 1
+                assert short.next_decode_eligible_step == scheduler.current_step + 2
+                if long is not None:
+                    assert plan.sampling_req_ids == (short.request_id,)
+                    assert long.num_output_placeholders == 0
+            else:
+                assert short.num_output_placeholders == 0
+        if len(queue) < 2:
+            continue
+        completed = queue.popleft()
+        scheduler.update_from_output(completed, _cohort_wavefront_output(completed))
+        completed_plan = completed.layered_prefill_plan
+        if completed_plan is not None and completed_plan.is_final_group:
+            break
+    else:
+        pytest.fail("boundary final interval did not retire")
+    assert [
+        layer for plan in plans for layer in range(plan.group_start, plan.group_end)
+    ] == list(range(32))
+    assert short.num_output_tokens == 1
+    assert short.num_output_placeholders == 0
+    if long is not None:
+        assert long.num_output_tokens == 0
+        assert long.num_computed_tokens == 4
+
+
+@pytest.mark.cpu_test
+def test_async_boundary_partial_abort_preserves_cohort_fence():
+    from vllm.v1.request import RequestStatus
+
+    from tests.v1.core.utils import create_requests
+
+    scheduler, _ = _decode_first_boundary_scheduler(
+        groups=8, budget=12, chunk_threshold=4, async_scheduling=True
+    )
+    aborted, survivor = create_requests(
+        num_requests=2, num_tokens=9, max_tokens=4, req_ids=["abort", "survivor"]
+    )
+    scheduler.add_request(aborted)
+    scheduler.add_request(survivor)
+    first = scheduler.schedule()
+    second = scheduler.schedule()
+    assert first.layered_prefill_plan is not None
+    assert second.layered_prefill_plan is not None
+    scheduler.finish_requests(aborted.request_id, RequestStatus.FINISHED_ABORTED)
+    assert scheduler.deferred_frees
+    scheduler.update_from_output(first, _cohort_wavefront_output(first))
+    assert scheduler.deferred_frees
+    continued = scheduler.schedule()
+    assert continued.layered_prefill_plan.prefill_req_ids == (survivor.request_id,)
+    scheduler.update_from_output(second, _cohort_wavefront_output(second))
+    assert not scheduler.deferred_frees
+    assert aborted.num_output_placeholders == survivor.num_output_placeholders == 0
 
 
 def _cohort_wavefront_output(step):
@@ -2850,14 +3316,22 @@ def test_boundary_batch_continuation_stays_in_lockstep_and_holds_next_chunk():
     first_plan = first.layered_prefill_plan
     second_plan = second.layered_prefill_plan
     assert first_plan is not None and second_plan is not None
-    assert first_plan.prefill_req_ids == second_plan.prefill_req_ids == (
-        prefills[0].request_id,
-        prefills[1].request_id,
+    assert (
+        first_plan.prefill_req_ids
+        == second_plan.prefill_req_ids
+        == (
+            prefills[0].request_id,
+            prefills[1].request_id,
+        )
     )
-    assert first_plan.query_tokens == second_plan.query_tokens == {
-        prefills[0].request_id: 4,
-        prefills[1].request_id: 4,
-    }
+    assert (
+        first_plan.query_tokens
+        == second_plan.query_tokens
+        == {
+            prefills[0].request_id: 4,
+            prefills[1].request_id: 4,
+        }
+    )
     assert second_plan.cohort_id == first_plan.cohort_id
     assert second_plan.group_start == first_plan.group_end
 

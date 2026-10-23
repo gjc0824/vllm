@@ -567,13 +567,12 @@ class Scheduler(SchedulerInterface):
             self.use_v2_model_runner
             and self.parallel_config.pipeline_parallel_size == 2
             and self.parallel_config.data_parallel_size == 1
-            and not self.scheduler_config.async_scheduling
             and self.num_spec_tokens == 0
             and self.ec_connector is None
             and self._layered_prefill_supported_for_scheduler()
         ):
             raise ValueError(
-                "pp_transition requires MRV2, PP2, DP1, synchronous scheduling, "
+                "pp_transition requires MRV2, PP2, DP1, "
                 "no speculative decoding, DBO or connectors"
             )
         if self.layered_prefill_policy.config.max_prefill_batch_size > 1:
@@ -1291,12 +1290,12 @@ class Scheduler(SchedulerInterface):
                 plan.commit_tokens[req_id],
                 plan.is_final_chunk,
             )
+        # _schedule_regular can have scheduled zero D rows; the appended
+        # frozen query still constitutes a nonempty, ordered KV write.
+        if self.defer_block_free and self.sched_step_seq == previous_fence:
+            self.sched_step_seq += 1
         self._attach_running_decodes_to_layered_output(scheduler_output, candidate)
         if self._boundary_enabled() and self.defer_block_free:
-            # _schedule_regular can have scheduled zero D rows; the appended
-            # frozen query still constitutes a nonempty, ordered KV write.
-            if self.sched_step_seq == previous_fence:
-                self.sched_step_seq += 1
             omitted_decodes = sum(
                 self._is_layered_decode_request(r)
                 and not r.num_in_flight_tokens
@@ -1427,7 +1426,6 @@ class Scheduler(SchedulerInterface):
             not self.use_v2_model_runner
             or not self.use_pp
             or self.parallel_config.pipeline_parallel_size != 2
-            or self.scheduler_config.async_scheduling
         ):
             return None
         # Running order must not let an older cohort's PP0 continuation
@@ -1506,8 +1504,7 @@ class Scheduler(SchedulerInterface):
         """Allow ordered same-chunk RPCs, never an in-flight next chunk."""
         return bool(
             self.use_v2_model_runner
-            and self.use_pp
-            and not self.scheduler_config.async_scheduling
+            and (self.use_pp or self.scheduler_config.async_scheduling)
             and request.layered_prefill_kv_reserved
             and request.layered_prefill_group_id > 0
             and request.num_stale_output_tokens == 0
@@ -1667,6 +1664,14 @@ class Scheduler(SchedulerInterface):
                 continue
             if not self._is_layered_decode_request(request):
                 continue
+            if (
+                request.num_output_placeholders > 0
+                and request.num_computed_tokens + 2 - request.num_output_placeholders
+                >= request.num_prompt_tokens + request.max_tokens
+            ):
+                # Match regular async admission: an in-flight sample already
+                # reaches max_tokens, so appending another Decode is invalid.
+                continue
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -1692,11 +1697,23 @@ class Scheduler(SchedulerInterface):
             if copies:
                 extra_copies.extend(copies)
                 extra_retained.extend(retained)
+            if request.spec_token_ids:
+                num_scheduled_spec_tokens = (
+                    num_new_tokens
+                    + request.num_computed_tokens
+                    - request.num_tokens
+                    - request.num_output_placeholders
+                )
+                if num_scheduled_spec_tokens > 0:
+                    scheduler_output.scheduled_spec_decode_tokens[req_id] = (
+                        request.spec_token_ids[:num_scheduled_spec_tokens]
+                    )
+                request.spec_token_ids = []
             cached = self._make_cached_request_data(
                 [request],
                 [],
                 {req_id: num_new_tokens},
-                {},
+                scheduler_output.scheduled_spec_decode_tokens,
                 {req_id: new_blocks},
             )
             self._append_cached_request_data(
@@ -1706,15 +1723,26 @@ class Scheduler(SchedulerInterface):
             scheduler_output.total_num_scheduled_tokens += num_new_tokens
             request.num_computed_tokens += num_new_tokens
             request.num_in_flight_tokens += num_new_tokens
+            if self.defer_block_free:
+                request.last_sched_seq = self.sched_step_seq
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
+            scheduler_output.has_structured_output_requests |= (
+                request.use_structured_output and not request.is_prefill_chunk
+            )
+            self._update_after_scheduled_decode(request, scheduler_output)
             self.prev_step_scheduled_req_ids.add(req_id)
             remaining -= num_new_tokens
         if extra_copies:
             existing_copies = scheduler_output.kv_cache_block_copies or []
             scheduler_output.kv_cache_block_copies = existing_copies + extra_copies
             self._free_cow_retained_blocks(extra_retained, self.sched_step_seq + 1)
+
+    def _update_after_scheduled_decode(
+        self, request: Request, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Hook for async sample bookkeeping after a late Decode append."""
 
     def _has_layered_decode_work(self, candidate: Request) -> bool:
         """Return whether another request can provide the D half of a step."""
@@ -1880,6 +1908,7 @@ class Scheduler(SchedulerInterface):
             and request.num_prompt_tokens > 0
             and request.num_computed_tokens < request.num_prompt_tokens
             and not request.output_token_ids
+            and not getattr(request, "num_stale_output_tokens", 0)
             and sampling_params is not None
             and sampling_params.logprobs is None
             and sampling_params.prompt_logprobs is None
@@ -1918,10 +1947,10 @@ class Scheduler(SchedulerInterface):
 
     def _layered_prefill_supported_for_scheduler(self) -> bool:
         # The layered policy is connector-free.  With async scheduling the
-        # worker still receives strictly paired execute/sample calls, so the
-        # single frontier per request stays valid at PP=1; PP>1 keeps the
-        # gate because async PP replaces the token echo with a GPU broadcast
-        # ring that the layered one-send-per-step payload does not join.
+        # worker receives ordered execute/sample calls, so a request's next
+        # group consumes the preceding frontier. MRV2 joins the sampled-token
+        # ring through the scheduler's shared RingStepPlan, including empty
+        # intermediate P rows. MRV1 has no such PP async protocol.
         # Prefix caching is supported: admission reuses completed blocks and
         # every finished chunk publishes its blocks to the cache.  TP ranks
         # consume the same SchedulerOutput through the normal worker
@@ -1937,6 +1966,7 @@ class Scheduler(SchedulerInterface):
             and not (
                 self.scheduler_config.async_scheduling
                 and parallel_config.pipeline_parallel_size > 1
+                and not self.use_v2_model_runner
             )
             and not getattr(parallel_config, "enable_dbo", False)
             and (
@@ -1982,6 +2012,8 @@ class Scheduler(SchedulerInterface):
         commit_tokens = plan.commit_tokens[req_id]
         request.num_in_flight_tokens += query_tokens
         request.num_computed_tokens += commit_tokens
+        if self.defer_block_free:
+            request.last_sched_seq = self.sched_step_seq
         request.is_prefill_chunk = commit_tokens == 0
         if request.is_prefill_chunk:
             self._inflight_prefills.add(request)
@@ -1992,10 +2024,8 @@ class Scheduler(SchedulerInterface):
             )
         request.layered_prefill_group_id += 1
         if not request.is_prefill_chunk:
-            # Every layer group has covered this chunk, so the chunk's KV
-            # blocks are complete for all layers and may enter the prefix
-            # cache even while later chunks are still prefilling.
-            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+            # Publishing the chunk's KV must wait for its final group to
+            # retire in _cache_layered_prefill_blocks.
             if request.num_computed_tokens < request.num_prompt_tokens:
                 self.layered_prefill_policy.plan_chunk(
                     request, request.num_computed_tokens
@@ -2027,9 +2057,17 @@ class Scheduler(SchedulerInterface):
             return
         for req_id in plan.prefill_req_ids:
             request = self.requests.get(req_id)
-            if request is None or request.num_computed_tokens <= 0:
+            if (
+                request is None
+                or request.num_computed_tokens <= 0
+                or request.num_stale_output_tokens > 0
+            ):
                 continue
-            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+            # Decode may already be queued past this chunk. Publish only
+            # the cursor completed by this particular output, never that
+            # newer scheduler cursor or a preempted generation's output.
+            completed_tokens = plan.cached_tokens[req_id] + plan.commit_tokens[req_id]
+            self.kv_cache_manager.cache_blocks(request, completed_tokens)
 
     def _schedule_regular(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1

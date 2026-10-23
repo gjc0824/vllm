@@ -172,8 +172,6 @@ class Worker(WorkerBase):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
-        # pending non-blocking PP send work from the previous iteration
-        self._pp_send_work: list[Handle] = []
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -190,6 +188,8 @@ class Worker(WorkerBase):
         return self._sleep_mode_backend
 
     def sleep(self, level: int = 1) -> None:
+        if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
+            get_pp_group().drain_isends()
         torch.accelerator.synchronize()
         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
 
@@ -1019,12 +1019,6 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # ensure any previous non-blocking PP sends are complete
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
-
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -1097,8 +1091,8 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # launch non-blocking send of intermediate tensors
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
+        # The coordinator owns send snapshots through background completion.
+        get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
@@ -1314,6 +1308,8 @@ class Worker(WorkerBase):
 
     def shutdown(self) -> None:
         gc.unfreeze()
+        if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
+            get_pp_group().shutdown_isends()
 
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:

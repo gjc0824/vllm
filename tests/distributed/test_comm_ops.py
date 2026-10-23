@@ -5,7 +5,11 @@
 Run `pytest tests/distributed/test_comm_ops.py`.
 """
 
+import weakref
 from collections.abc import Callable
+from contextlib import contextmanager
+from threading import Event
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -22,7 +26,11 @@ from vllm.distributed import (
 )
 from vllm.distributed.device_communicators import flashinfer_all_reduce
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
-from vllm.distributed.parallel_state import GroupCoordinator, TensorMetadata
+from vllm.distributed.parallel_state import (
+    GroupCoordinator,
+    TensorMetadata,
+    _wait_for_send,
+)
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 from ..utils import (
@@ -236,6 +244,115 @@ def _make_group_for_unit_test(
     g.device_group = None
     g.cpu_group = None
     return g
+
+
+@pytest.mark.parametrize("payload", [False, True])
+def test_isend_owns_buffers_until_actual_wait_completes(
+    monkeypatch: pytest.MonkeyPatch, payload: bool
+) -> None:
+    """Delayed Gloo copies must retain buffers and survive source reuse."""
+    gate = Event()
+    posted = []
+    snapshots = []
+    works = []
+
+    class DelayedWork(_DummyWork):
+        def __init__(self, tensor):
+            super().__init__()
+            self.tensor = weakref.ref(tensor)
+
+        def is_completed(self):
+            # Deliberately lie like Gloo versions with premature completion.
+            return True
+
+        def wait(self):
+            self.wait_calls += 1
+            assert gate.wait(5), "test did not release the delayed receiver"
+            tensor = self.tensor()
+            assert tensor is not None
+            snapshots.append(tensor.clone())
+
+    def isend(tensor, **kwargs):
+        posted.append(weakref.ref(tensor))
+        work = DelayedWork(tensor)
+        works.append(work)
+        return work
+
+    monkeypatch.setattr(torch.distributed, "isend", isend)
+    g = _make_group_for_unit_test()
+    source = torch.arange(4)
+    data = {"a": source} if payload else {"meta": "no-tensors"}
+    try:
+        handles = g.isend_tensor_dict(data)
+        assert len(posted) == (3 if payload else 2)
+        assert not handles[0].is_completed()
+        source.fill_(-1)
+        g._reap_completed_isends()
+        assert len(g._pending_isends) == 1
+        assert all(ref() is not None for ref in posted)
+        gate.set()
+        handles[0].wait()
+        handles[0].wait()
+        assert all(work.wait_calls == 1 for work in works)
+        if payload:
+            torch.testing.assert_close(snapshots[-1], torch.arange(4))
+        g._reap_completed_isends()
+        assert not g._pending_isends
+    finally:
+        gate.set()
+        g.shutdown_isends()
+        g.shutdown_isends()
+
+
+def test_isend_background_failure_is_reported_on_reap(monkeypatch):
+    class FailedWork:
+        def wait(self):
+            raise RuntimeError("send failed")
+
+    monkeypatch.setattr(torch.distributed, "isend", lambda *a, **kw: FailedWork())
+    g = _make_group_for_unit_test()
+    handle = g.isend_tensor_dict({"metadata": 1})[0]
+    with pytest.raises(RuntimeError, match="send failed"):
+        handle.wait()
+    with pytest.raises(RuntimeError, match="send failed"):
+        g._reap_completed_isends()
+    with pytest.raises(RuntimeError, match="send failed"):
+        g.shutdown_isends()
+    g.shutdown_isends()
+
+
+def test_device_send_completion_waits_on_dedicated_stream(monkeypatch):
+    order = []
+    device = torch.device("privateuseone:0")
+
+    @contextmanager
+    def device_context(value):
+        assert value == device
+        order.append("device_enter")
+        yield
+        order.append("device_exit")
+
+    @contextmanager
+    def stream_context(value):
+        assert value is stream
+        order.append("stream_enter")
+        yield
+        order.append("stream_exit")
+
+    stream = SimpleNamespace(synchronize=lambda: order.append("complete"))
+    module = SimpleNamespace(
+        device=device_context, Stream=lambda: stream, stream=stream_context
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda value: module)
+    work = SimpleNamespace(wait=lambda: order.append("wait"))
+    tensor = SimpleNamespace(is_cpu=False, device=device)
+    streams = {}
+    _wait_for_send([(work, tensor)], streams)
+    assert order == [
+        "device_enter", "stream_enter", "wait", "stream_exit",
+        "complete", "device_exit",
+    ]
+    assert streams[device] is stream
 
 
 def test_irecv_tensor_dict_send_allgather_postprocess_binds_keys(

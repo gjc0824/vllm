@@ -27,8 +27,9 @@ import contextlib
 import gc
 import pickle
 import weakref
-from collections import namedtuple
+from collections import deque, namedtuple
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
@@ -76,6 +77,60 @@ class Handle(Protocol):
     def is_completed(self) -> bool: ...
 
     def wait(self) -> None: ...
+
+
+_MAX_PENDING_SENDS_PER_RANK = 2
+
+
+class _SendHandle:
+    """Completion of a send whose buffers are owned by the completion task."""
+
+    def __init__(self, future: Future[None]) -> None:
+        self._future = future
+
+    def is_completed(self) -> bool:
+        return self._future.done()
+
+    def wait(self) -> None:
+        # Future.result is repeatable; the underlying P2P Work.wait need not be.
+        self._future.result()
+
+
+def _wait_for_send(
+    works: list[tuple[Any, torch.Tensor]],
+    completion_streams: dict[torch.device, Any],
+) -> None:
+    """Wait off the execution thread, retaining every source until completion."""
+    device_works: dict[torch.device, list[Any]] = {}
+    failure: Exception | None = None
+    for work, tensor in works:
+        if tensor.is_cpu:
+            # Gloo P2P is_completed is not a safe buffer-lifetime signal.
+            try:
+                work.wait()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+        else:
+            device_works.setdefault(tensor.device, []).append(work)
+    for device, pending in device_works.items():
+        device_module = torch.get_device_module(device)
+        with device_module.device(device):
+            stream = completion_streams.get(device)
+            if stream is None:
+                stream = completion_streams[device] = device_module.Stream()
+            with device_module.stream(stream):
+                for work in pending:
+                    try:
+                        work.wait()
+                    except Exception as exc:
+                        if failure is None:
+                            failure = exc
+            # NCCL/HCCL wait may only insert a stream dependency. Synchronize
+            # this dedicated stream before releasing the send snapshots.
+            stream.synchronize()
+    if failure is not None:
+        raise failure
 
 
 def _split_tensor_dict(
@@ -846,6 +901,88 @@ class GroupCoordinator:
 
         return None
 
+    def _prepare_isend(self) -> None:
+        # Ascend and other subclasses may replace __init__ without super().
+        if not hasattr(self, "_send_executor"):
+            self._send_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vllm-p2p-completion"
+            )
+            self._pending_isends: deque[_SendHandle] = deque()
+            self._send_completion_streams: dict[torch.device, Any] = {}
+        self._reap_completed_isends()
+        # Bound owned snapshots if a producer outruns its receiver. Normal PP
+        # execution has at most a pipeline's worth of batches in flight.
+        if len(self._pending_isends) >= (
+            _MAX_PENDING_SENDS_PER_RANK * self.world_size
+        ):
+            self._pending_isends[0].wait()
+            self._pending_isends.popleft()
+
+    def _submit_isend(self, works: list[tuple[Any, torch.Tensor]]) -> _SendHandle:
+        handle = _SendHandle(
+            self._send_executor.submit(
+                _wait_for_send, works, self._send_completion_streams
+            )
+        )
+        self._pending_isends.append(handle)
+        return handle
+
+    def _reap_completed_isends(self) -> None:
+        pending = getattr(self, "_pending_isends", ())
+        while pending and pending[0].is_completed():
+            # Propagate background failures even for fire-and-forget callers.
+            pending[0].wait()
+            pending.popleft()
+
+    def drain_isends(self) -> None:
+        """Finish outstanding sends before sleep, teardown, or buffer release."""
+        pending = getattr(self, "_pending_isends", ())
+        while pending:
+            pending[0].wait()
+            pending.popleft()
+
+    def shutdown_isends(self) -> None:
+        """Drain and stop the completion thread before destroying its groups."""
+        executor = getattr(self, "_send_executor", None)
+        if executor is None:
+            return
+        try:
+            self.drain_isends()
+        finally:
+            executor.shutdown(wait=True)
+            del self._send_executor
+            self._send_completion_streams.clear()
+
+    def _post_object_send(
+        self, obj: Any, dst: int
+    ) -> list[tuple[Any, torch.Tensor]]:
+        assert 0 <= dst < self.world_size, f"Invalid dst rank ({dst})"
+        assert dst != self.rank_in_group, "Cannot send an object to this rank"
+        object_tensor = torch.frombuffer(
+            bytearray(pickle.dumps(obj)), dtype=torch.uint8
+        )
+        size_tensor = torch.tensor(
+            [object_tensor.numel()], dtype=torch.long, device="cpu"
+        )
+        works: list[tuple[Any, torch.Tensor]] = []
+        try:
+            for tensor in (size_tensor, object_tensor):
+                work = torch.distributed.isend(
+                    tensor, dst=self.ranks[dst], group=self.cpu_group
+                )
+                if work is not None:
+                    works.append((work, tensor))
+        except BaseException:
+            if works:
+                self._submit_isend(works)
+            raise
+        return works
+
+    def isend_object(self, obj: Any, dst: int) -> Handle:
+        """Post size and serialized data without waiting for the receiver."""
+        self._prepare_isend()
+        return self._submit_isend(self._post_object_send(obj, dst))
+
     def recv_object(self, src: int) -> Any:
         """Receive the input object list from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
@@ -1014,6 +1151,7 @@ class GroupCoordinator:
         )
         for handle in handles:
             handle.wait()
+        self._reap_completed_isends()
         return None
 
     def isend_tensor_dict(
@@ -1023,6 +1161,12 @@ class GroupCoordinator:
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
     ) -> list[Handle]:
+        """Send an owned snapshot; returned handles may safely be discarded.
+
+        Cloning isolates reusable graph outputs and mutable CPU payloads from
+        later iterations. Completion tasks retain these buffers through actual
+        CPU and device completion, including metadata-only messages.
+        """
         if self.world_size <= 1:
             return []
 
@@ -1047,31 +1191,35 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
 
+        self._prepare_isend()
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        self.send_object(metadata_list, dst=dst)
+        works = self._post_object_send(metadata_list, dst=dst)
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
 
-        handles: list[Handle] = []
-        for key, tensor in zip(tensor_keys, tensor_list):
-            if tensor.numel() == 0:
-                continue
+        try:
+            for key, tensor in zip(tensor_keys, tensor_list):
+                if tensor.numel() == 0:
+                    continue
 
-            if self._should_use_all_gather(
-                key, tensor.numel(), all_gather_group, all_gather_tensors
-            ):
-                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                if self._should_use_all_gather(
+                    key, tensor.numel(), all_gather_group, all_gather_tensors
+                ):
+                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
-            comm_group = metadata_group if tensor.is_cpu else group
-            handle = torch.distributed.isend(
-                tensor, dst=self.ranks[dst], group=comm_group
-            )
-            if tensor.is_cuda:
-                tensor.record_stream(torch.cuda.current_stream(tensor.device))
-            handles.append(handle)
+                tensor = tensor.clone()
+                comm_group = metadata_group if tensor.is_cpu else group
+                handle = torch.distributed.isend(
+                    tensor, dst=self.ranks[dst], group=comm_group
+                )
+                if handle is not None:
+                    works.append((handle, tensor))
+        except BaseException:
+            self._submit_isend(works)
+            raise
 
-        return handles
+        return [self._submit_isend(works)]
 
     def recv_tensor_dict(
         self,
@@ -1223,6 +1371,7 @@ class GroupCoordinator:
         return self.device_communicator.recv(size, dtype, src)
 
     def destroy(self):
+        self.shutdown_isends()
         if hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
